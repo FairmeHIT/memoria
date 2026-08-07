@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling>=1.27,<2"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memoria"
+version = "0.4.0"
+description = "A local Agent Memory Leaderboard Add/Search memory engine."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "fastapi>=0.115,<1",
+  "pydantic>=2.10,<3",
+  "python-dotenv>=1.0,<2",
+  "uvicorn[standard]>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx>=0.28,<1",
+  "pytest>=8.3,<10",
+  "pytest-cov>=6,<8",
+]
+
+[project.scripts]
+memoria-cleanup = "memoria.retention:main"
+memoria-evaluate = "memoria.evaluation:main"
+memoria-load = "memoria.ingest:main"
+memoria-prepare-benchmark = "memoria.benchmarks:main"
+memoria-reindex-vectors = "memoria.reindex:main"
+memoria-smoke-bge = "memoria.bge_smoke:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/memoria"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-config --strict-markers --cov=memoria --cov-report=term-missing --cov-fail-under=80"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["memoria"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
