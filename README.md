@@ -1,9 +1,5 @@
 # memoria
 
-`memoria` is a Docker-deployable memory backend for the Agent Memory
-Leaderboard. It stores ordered source messages, enforces `user_id` isolation,
-and returns ranked evidence through Search.
-
 Deployment and method disclosure:
 
 - [DEPLOYMENT.md](DEPLOYMENT.md)
