@@ -32,6 +32,7 @@ memoria-evaluate = "memoria.evaluation:main"
 memoria-load = "memoria.ingest:main"
 memoria-prepare-benchmark = "memoria.benchmarks:main"
 memoria-reindex-vectors = "memoria.reindex:main"
+memoria-seed-procedures = "memoria.seed_procedures:main"
 memoria-smoke-bge = "memoria.bge_smoke:main"
 
 [tool.hatch.build.targets.wheel]

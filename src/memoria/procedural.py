@@ -47,6 +47,10 @@ class ProceduralMemory:
     """提取置信度 (0-1)"""
     steps: list[str] = field(default_factory=list)
     """步骤列表（仅 procedure）"""
+    applies_when: str = ""
+    """适用条件描述（如 'when working on TypeScript files'）"""
+    do_not_apply_when: str = ""
+    """不适用的条件（如 'when running tests'）"""
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -235,6 +235,8 @@ CREATE TABLE IF NOT EXISTS procedural_memories (
     statement TEXT NOT NULL,
     sentiment TEXT DEFAULT 'neutral' CHECK(sentiment IN ('positive', 'negative', 'neutral')),
     confidence REAL DEFAULT 0.7,
+    applies_when TEXT DEFAULT '',
+    do_not_apply_when TEXT DEFAULT '',
     created_at TEXT NOT NULL
 );
 
@@ -306,6 +308,14 @@ class MemoryStore:
                         SELECT 1 FROM memories_fts_porter p WHERE p.memory_id = m.id
                     )
                 """)
+                # 迁移：为旧数据库添加 applies_when / do_not_apply_when 列
+                for col in ("applies_when", "do_not_apply_when"):
+                    has = connection.execute(
+                        "SELECT COUNT(*) AS cnt FROM pragma_table_info('procedural_memories') WHERE name = ?",
+                        (col,),
+                    ).fetchone()[0]
+                    if not has:
+                        connection.execute(f"ALTER TABLE procedural_memories ADD COLUMN {col} TEXT DEFAULT ''")
             finally:
                 connection.close()
 
@@ -1095,8 +1105,9 @@ class MemoryStore:
                 """
                 INSERT OR REPLACE INTO procedural_memories (
                     memory_id, user_id, proc_type, entity, trigger_text,
-                    statement, sentiment, confidence, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    statement, sentiment, confidence, applies_when,
+                    do_not_apply_when, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     memory_id,
@@ -1107,6 +1118,8 @@ class MemoryStore:
                     proc.statement[:500],
                     proc.sentiment,
                     proc.confidence,
+                    proc.applies_when[:500],
+                    proc.do_not_apply_when[:500],
                     created_at,
                 ),
             )
@@ -1128,7 +1141,8 @@ class MemoryStore:
             return {}
         rows = connection.execute(
             """
-            SELECT memory_id, proc_type, entity, trigger_text, statement, confidence
+            SELECT memory_id, proc_type, entity, trigger_text, statement, confidence,
+                   applies_when, do_not_apply_when
             FROM procedural_memories
             WHERE user_id = ?
             """,
@@ -1143,12 +1157,20 @@ class MemoryStore:
             entity = str(row["entity"] or "").casefold()
             trigger = str(row["trigger_text"] or "").casefold()
             statement = str(row["statement"] or "").casefold()
+            applies_when = str(row["applies_when"] or "").casefold()
+            do_not_apply_when = str(row["do_not_apply_when"] or "").casefold()
+            # 如果不适用条件匹配 → 跳过
+            if do_not_apply_when and (do_not_apply_when in q or do_not_apply_when in opt_text):
+                continue
             if entity and (entity in q or entity in opt_text):
                 score += 0.30
             if trigger and (trigger in q or trigger in opt_text):
                 score += 0.20
             if statement and (statement in q or statement in opt_text):
                 score += 0.15
+            # 如果 query 与 applies_when 匹配 → 额外加分（适用场景匹配）
+            if applies_when and (applies_when in q or applies_when in opt_text):
+                score += 0.25
             # 偏好型记忆基础 boost：procedural 查询天然偏好这类记忆
             if proc_type in ("preference", "routine"):
                 score += 0.05
