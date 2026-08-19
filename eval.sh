@@ -40,8 +40,16 @@ run_full_benchmark() {
     echo "  LoCoMo 完整基准: embed=$embed_backend  $*"
     echo "───────────────────────────────────────────────"
     rm -rf /tmp/memoria_bench/db
-    MEMORIA_EMBEDDING_BACKEND="$embed_backend" .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
-    MEMORIA_EMBEDDING_BACKEND="$embed_backend" .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
+    MEMORIA_EMBEDDING_BACKEND="$embed_backend" \
+    MEMORIA_RERANKER_BACKEND="$RERANKER" \
+    MEMORIA_BGE_EMBEDDING_MODEL="models/bge-small-en-v1.5" \
+    MEMORIA_RERANKER_MODEL="models/cross-encoder-ms-marco-MiniLM-L-6-v2" \
+    .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
+    MEMORIA_EMBEDDING_BACKEND="$embed_backend" \
+    MEMORIA_RERANKER_BACKEND="$RERANKER" \
+    MEMORIA_BGE_EMBEDDING_MODEL="models/bge-small-en-v1.5" \
+    MEMORIA_RERANKER_MODEL="models/cross-encoder-ms-marco-MiniLM-L-6-v2" \
+    .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
     echo ""
 }
 
