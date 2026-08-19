@@ -18,6 +18,7 @@ from typing import Literal, Protocol
 from memoria.claims import Claim, extract_claims
 from memoria.config import Settings
 from memoria.embeddings import EmbeddingProvider, EmbeddingUnavailable, deserialize_vector, serialize_vector
+from memoria.procedural import extract_procedural, is_procedural_query
 from memoria.schemas import AddRequest, AddResponse, SearchHit
 
 # ────────────────────────────────────────────────────────────── 权重常量
@@ -223,6 +224,21 @@ CREATE TABLE IF NOT EXISTS model_audit (
 
 CREATE INDEX IF NOT EXISTS model_audit_created_at_idx ON model_audit(created_at);
 
+CREATE TABLE IF NOT EXISTS procedural_memories (
+    memory_id TEXT PRIMARY KEY REFERENCES memories(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    proc_type TEXT NOT NULL CHECK(proc_type IN ('preference', 'routine', 'procedure')),
+    entity TEXT NOT NULL,
+    trigger_text TEXT DEFAULT '',
+    statement TEXT NOT NULL,
+    sentiment TEXT DEFAULT 'neutral' CHECK(sentiment IN ('positive', 'negative', 'neutral')),
+    confidence REAL DEFAULT 0.7,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS procedural_memories_user_type_idx
+    ON procedural_memories(user_id, proc_type);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     memory_id UNINDEXED,
     content,
@@ -414,6 +430,17 @@ class MemoryStore:
                             created_at=created_at,
                             claims=extract_claims(message.content),
                         )
+                    # 程序性记忆：偏好/习惯/流程 → 独立表（失败不影响主流程）
+                    try:
+                        self._record_procedural_if_any(
+                            connection=connection,
+                            memory_id=memory_id,
+                            user_id=request.user_id,
+                            content=message.content,
+                            created_at=created_at,
+                        )
+                    except Exception:
+                        pass
                 connection.execute("COMMIT")
                 return response
             except Exception:
@@ -606,6 +633,10 @@ class MemoryStore:
                 if historical
                 else self._superseded_memory_ids(connection, [str(row["id"]) for row in rows])
             )
+            # 程序性记忆 boosting：查询涉及偏好/习惯/流程时拉取匹配项
+            procedural_boosts: dict[str, float] = self._procedural_boosts(
+                connection=connection, user_id=user_id, query=query
+            )
         finally:
             connection.close()
 
@@ -636,6 +667,17 @@ class MemoryStore:
         )
         if self._reranker is not None and ranked:
             ranked = self._apply_reranker(query, ranked)
+        # 程序性记忆 boosting
+        if procedural_boosts:
+            ranked = [
+                RankedMemory(
+                    id=item.id, content=item.content,
+                    score=item.score + procedural_boosts.get(item.id, 0.0),
+                    created_at=item.created_at, content_hash=item.content_hash,
+                )
+                for item in ranked
+            ]
+            ranked.sort(key=lambda item: (-item.score, item.created_at, item.id))
         selected: list[SearchHit] = []
         seen_content_hashes: set[str] = set()
         for item in ranked:
@@ -1011,6 +1053,85 @@ class MemoryStore:
                 """,
                 ((memory_id, str(row["memory_id"])) for row in prior_rows),
             )
+
+    def _record_procedural_if_any(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        memory_id: str,
+        user_id: str,
+        content: str,
+        created_at: str,
+    ) -> None:
+        """提取消息中的程序性记忆（偏好/习惯/流程）并写入 procedural_memories。
+
+        M-Flow procedural memory 的轻量实现：纯规则提取、无 LLM。
+        仅接受确定性匹配的候选，避免过度提取。
+        """
+        extracted = extract_procedural(content)
+        for proc in extracted:
+            connection.execute(
+                """
+                INSERT OR REPLACE INTO procedural_memories (
+                    memory_id, user_id, proc_type, entity, trigger_text,
+                    statement, sentiment, confidence, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    user_id,
+                    proc.proc_type,
+                    proc.entity[:200],
+                    proc.trigger[:200],
+                    proc.statement[:500],
+                    proc.sentiment,
+                    proc.confidence,
+                    created_at,
+                ),
+            )
+
+    def _procedural_boosts(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        user_id: str,
+        query: str,
+    ) -> dict[str, float]:
+        """计算查询对程序性记忆的 boosting 分数。
+
+        仅当查询本身涉及偏好/习惯/流程时才激活，避免干扰普通事实检索。
+        """
+        if not is_procedural_query(query):
+            return {}
+        rows = connection.execute(
+            """
+            SELECT memory_id, proc_type, entity, trigger_text, statement, confidence
+            FROM procedural_memories
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        ).fetchall()
+        q = query.casefold()
+        boosts: dict[str, float] = {}
+        for row in rows:
+            score = 0.0
+            proc_type = str(row["proc_type"] or "")
+            entity = str(row["entity"] or "").casefold()
+            trigger = str(row["trigger_text"] or "").casefold()
+            statement = str(row["statement"] or "").casefold()
+            if entity and entity in q:
+                score += 0.30
+            if trigger and trigger in q:
+                score += 0.20
+            if statement and statement in q:
+                score += 0.15
+            # 偏好型记忆基础 boost：procedural 查询天然偏好这类记忆
+            if proc_type in ("preference", "routine"):
+                score += 0.05
+            if score > 0:
+                boost = min(score, 1.0) * float(row["confidence"])
+                boosts[str(row["memory_id"])] = max(boosts.get(str(row["memory_id"]), 0.0), boost)
+        return boosts
 
     def _superseded_memory_ids(
         self, connection: sqlite3.Connection, memory_ids: list[str]
