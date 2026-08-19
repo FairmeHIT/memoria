@@ -33,6 +33,7 @@ W_OPTION_FALLBACK = 0.2      # 非混合模式下的选项覆盖率权重
 W_RECENCY_LATEST = 0.10      # "最新"意图时的新近度加分
 W_RECENCY_EARLIEST = 0.10    # "最早"意图时的旧度加分
 W_TIMEPOINT_MILD = 0.025     # 时间点/序列问题的基础加分
+W_TEMPORAL_RERANK = 0.30    # 重排阶段的时间感知权重（CrossEncoder 分数 + 时间分）
 CONTEXT_RADIUS = 2           # 邻接上下文窗口半径（会话内前后 N 条）
 CONTEXT_MAX_CHARS = 2000     # 上下文扩展的最大字符数
 TEMPORAL_ENRICHMENT = True   # 是否在证据中附加角色 + 日期前缀（InvMem 风格）
@@ -84,6 +85,10 @@ LATEST_MARKERS = frozenset({
 EARLIEST_MARKERS = frozenset({
     "first", "earliest", "initial", "originally", "at first",
     "最早", "首先", "第一次", "起初", "原先",
+})
+HISTORICAL_MARKERS = frozenset({
+    "in the past", "used to", "formerly", "previously", "before",
+    "以前", "过去",
 })
 SEQUENCE_MARKERS = frozenset({
     "before", "after", "earlier", "later", "timeline", "sequence", "order", "previous", "next", "subsequent",
@@ -522,8 +527,15 @@ class MemoryStore:
         temporal_intent = _detect_temporal_intent(query)
         primary_expression = _fts_expression(query, temporal_intent=temporal_intent)
         option_expression = _fts_expression(" ".join(options or []))
+        # InvMem enhanced 模式：每个选项单独成查询视图（query + option），
+        # 各自检索后按 RRF 融合，避免扁平查询丢失选项细节。
+        use_enhanced = ENHANCED_OPTIONS and options
         query_vector = self._embed_query(query)
-        if not primary_expression and not option_expression and query_vector is None:
+        if (
+            not primary_expression
+            and not option_expression
+            and query_vector is None
+        ):
             self._record_search_audit(
                 user_id=user_id,
                 query=query,
@@ -543,7 +555,18 @@ class MemoryStore:
                 ).fetchone()[0]
             )
             if primary_expression or option_expression:
-                if user_count <= 5_000:
+                if use_enhanced:
+                    # 增强选项视图：每个 (query+option) 视图独立检索 → RRF 融合
+                    lexical_rows, lexical_ranks = self._enhanced_candidate_retrieval(
+                        connection=connection,
+                        query=query,
+                        options=options or [],
+                        user_id=user_id,
+                        candidate_limit=candidate_limit,
+                        rrf_k=self._settings.rrf_k,
+                        temporal_intent=temporal_intent,
+                    )
+                elif user_count <= 5_000:
                     lexical_rows = self._scoped_candidate_rows(
                         connection=connection,
                         query=query,
@@ -551,6 +574,7 @@ class MemoryStore:
                         user_id=user_id,
                         candidate_limit=candidate_limit,
                     )
+                    lexical_ranks = _candidate_ranks(lexical_rows, query, options or [])
                 else:
                     lexical_rows = self._candidate_rows(
                         connection=connection,
@@ -558,8 +582,10 @@ class MemoryStore:
                         user_id=user_id,
                         candidate_limit=candidate_limit,
                     )
+                    lexical_ranks = _candidate_ranks(lexical_rows, query, options or [])
             else:
                 lexical_rows = []
+                lexical_ranks = {}
             vector_rows, vector_similarities = self._vector_candidate_rows(
                 connection=connection,
                 user_id=user_id,
@@ -574,7 +600,7 @@ class MemoryStore:
             )
             rows = list(rows_by_id.values())
             # 历史/最早意图 → 不过滤覆写（保留旧记录）
-            historical = temporal_intent == "earliest" or _is_historical_query(query)
+            historical = temporal_intent in ("earliest", "historical") or _is_historical_query(query)
             superseded_ids = (
                 set()
                 if historical
@@ -585,7 +611,6 @@ class MemoryStore:
 
         # 总是计算 recency 分数，由 _rank_memory 根据意图决定使用方式
         recency_scores = _recency_scores(rows)
-        lexical_ranks = _candidate_ranks(lexical_rows, query, options or [])
         vector_ranks = {
             str(row["id"]): rank for rank, row in enumerate(vector_rows, start=1)
         }
@@ -644,19 +669,48 @@ class MemoryStore:
         return selected
 
     def _apply_reranker(self, query: str, ranked: list[RankedMemory]) -> list[RankedMemory]:
+        # CrossEncoder (ms-marco) 是纯英文模型，中文查询跳过 CE 以免疫乱
+        if CJK_RE.search(query):
+            return ranked
+        temporal_intent = _detect_temporal_intent(query)
         candidates = ranked[: self._settings.reranker_candidate_limit]
         results = self._reranker.rerank(
             query,
             [item.content for item in candidates],
             top_n=len(candidates),
         )
+        # 收集原始 CE 分数，min-max 归一化到 [0,1] 再叠加时间分
+        raw_scores: list[float] = [score for _, score in results]
+        normalized = _min_max_normalize(raw_scores) if raw_scores else []
+        # 预计算时间分数 — 基于排序的 recency（避免被无关大 span 支配）
+        recency_map: dict[str, float] = {}
+        if temporal_intent != "none" and results:
+            ce_indices = {idx for idx, _ in results}
+            ce_items = [candidates[idx] for idx in ce_indices if 0 <= idx < len(candidates)]
+            valid = [(_created_at_seconds(item.created_at), item.id) for item in ce_items]
+            valid = [(ts, mid) for ts, mid in valid if ts is not None]
+            if len(valid) >= 2:
+                ordered = sorted(valid, key=lambda x: x[0])
+                for rank, (_, mid) in enumerate(ordered):
+                    recency_map[mid] = rank / (len(ordered) - 1)
         reranked: list[RankedMemory] = []
         seen_indexes: set[int] = set()
-        for index, score in results:
+        for (index, _score), norm_score in zip(results, normalized):
             if not 0 <= index < len(candidates) or index in seen_indexes:
                 continue
             seen_indexes.add(index)
+            score = norm_score
+            # 时间感知混合：时间意图查询时 CE 分数与时间分加权
+            if temporal_intent == "latest":
+                recency = recency_map.get(candidates[index].id, 0.5)
+                score = 0.4 * norm_score + 0.6 * recency
+            elif temporal_intent == "earliest":
+                recency = recency_map.get(candidates[index].id, 0.5)
+                score = 0.4 * norm_score + 0.6 * (1.0 - recency)
+            # historical/sequence/point: 不加时间偏向，纯 CE 分数
             reranked.append(replace(candidates[index], score=score))
+        # 重新按混合分数排序（CE 归一化 + 时间分）
+        reranked.sort(key=lambda item: (-item.score, item.created_at, item.id))
         fallback_score = min((item.score for item in reranked), default=0.0)
         for item in [
             *[candidates[index] for index in range(len(candidates)) if index not in seen_indexes],
@@ -789,7 +843,7 @@ class MemoryStore:
         self,
         *,
         connection: sqlite3.Connection,
-        expressions: tuple[str, str],
+        expressions: Sequence[str],
         user_id: str,
         candidate_limit: int,
     ) -> list[sqlite3.Row]:
@@ -814,6 +868,51 @@ class MemoryStore:
                 for row in rows:
                     rows_by_id.setdefault(str(row["id"]), row)
         return list(rows_by_id.values())
+
+    def _enhanced_candidate_retrieval(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        query: str,
+        options: list[str],
+        user_id: str,
+        candidate_limit: int,
+        rrf_k: int,
+        temporal_intent: str,
+    ) -> tuple[list[sqlite3.Row], dict[str, int]]:
+        """InvMem enhanced option views: per-(query+option) retrieval + RRF fusion.
+
+        Each option becomes its own query view ``query + opt``; the views are
+        retrieved independently from FTS and fused with reciprocal-rank
+        fusion, so an option keyword that the flat query misses still surfaces
+        the right memory.
+        """
+        view_queries = [query] + [f"{query} {opt}" for opt in options]
+        rows_by_id: dict[str, sqlite3.Row] = {}
+        fused_rrf: dict[str, float] = {}
+        for view_query in view_queries:
+            expression = _fts_expression(view_query, temporal_intent=temporal_intent)
+            view_rows = self._candidate_rows(
+                connection=connection,
+                expressions=(expression,),
+                user_id=user_id,
+                candidate_limit=candidate_limit,
+            )
+            if not view_rows:
+                continue
+            ranks = _candidate_ranks(view_rows, view_query, [])
+            for row in view_rows:
+                rid = str(row["id"])
+                rows_by_id.setdefault(rid, row)
+                rank = ranks.get(rid)
+                if rank is not None:
+                    fused_rrf[rid] = fused_rrf.get(rid, 0.0) + 1.0 / (rrf_k + rank)
+        # 融合后按 RRF 分数排序，转成单一 lexical rank 供 _rank_memory 使用
+        ordered = sorted(
+            fused_rrf.items(), key=lambda kv: (-kv[1], str(kv[0]))
+        )
+        lexical_ranks = {rid: rank for rank, (rid, _) in enumerate(ordered, start=1)}
+        return list(rows_by_id.values()), lexical_ranks
 
     def _vector_candidate_rows(
         self,
@@ -1161,13 +1260,15 @@ def _concept_expansion(query: str) -> set[str]:
 
 
 def _detect_temporal_intent(query: str) -> TemporalIntent:
-    """Classify the query's temporal intent (latest/earliest/sequence/point/none)."""
+    """Classify the query's temporal intent (latest/earliest/historical/sequence/point/none)."""
     normalized = query.casefold()
     # 中文和英文标记
     if any(m in normalized for m in LATEST_MARKERS):
         return "latest"
     if any(m in normalized for m in EARLIEST_MARKERS):
         return "earliest"
+    if any(m in normalized for m in HISTORICAL_MARKERS):
+        return "historical"
     if any(m in normalized for m in SEQUENCE_MARKERS):
         return "sequence"
     if any(m in normalized for m in POINT_MARKERS):
@@ -1283,10 +1384,17 @@ def _rank_memory(
     temporal_intent: str = "none",
 ) -> RankedMemory:
     query_terms = _canonical_terms(query)
-    option_terms = _canonical_terms(" ".join(options))
     content_terms = _canonical_terms(str(row["content"]))
     coverage_score = len(query_terms & content_terms) / len(query_terms) if query_terms else 0.0
-    option_coverage = len(option_terms & content_terms) / len(option_terms) if option_terms else 0.0
+    # 增强选项模式：取每个选项单独覆盖度的最大值
+    if ENHANCED_OPTIONS and options:
+        option_coverage = max(
+            len(_canonical_terms(opt) & content_terms) / max(len(_canonical_terms(opt)), 1)
+            for opt in options
+        ) if options else 0.0
+    else:
+        option_terms = _canonical_terms(" ".join(options))
+        option_coverage = len(option_terms & content_terms) / len(option_terms) if option_terms else 0.0
     bm25_score = float(row["bm25_score"])
     lexical_score = 1.0 / (1.0 + abs(bm25_score))
     if not hybrid:

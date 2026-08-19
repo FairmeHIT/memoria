@@ -146,7 +146,8 @@ def test_reranker_controls_return_order_and_scores(tmp_path) -> None:
 
     assert "another item" in hits[0].content, f"Expected another item first, got: {[h.content for h in hits]}"
     assert "relevant item" in hits[1].content, f"Expected relevant item second, got: {[h.content for h in hits]}"
-    assert [hit.score for hit in hits] == [0.9, 0.2]
+    # CrossEncoder 分数经 min-max 归一化：0.9 → 1.0, 0.2 → 0.0，排序保持
+    assert [hit.score for hit in hits] == [1.0, 0.0]
 
 
 def test_partial_reranker_response_keeps_scores_in_return_order(tmp_path) -> None:
