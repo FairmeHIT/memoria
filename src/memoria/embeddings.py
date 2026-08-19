@@ -249,6 +249,71 @@ def create_embedder(
     raise ValueError("MEMORIA_EMBEDDING_BACKEND must be none, hashing, qwen, bge, or local")
 
 
+class LocalCrossEncoder:
+    """Local CrossEncoder reranker via sentence-transformers (CPU, no external service).
+
+    Mirrors InvMem's approach: cross-encoder/ms-marco-MiniLM-L-6-v2 loaded
+    locally via sentence-transformers CrossEncoder. Takes a query and a list of
+    candidate documents, scores each (query, document) pair, and returns
+    ranked indices with scores. Runs on CPU, ~80 MB memory, ~1-2 ms per pair.
+
+    model_name can be a HuggingFace repo ID or a local path. When the path
+    does not exist, the model is downloaded automatically from the Hugging
+    Face mirror first.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+    ) -> None:
+        from sentence_transformers import CrossEncoder
+
+        self.model_name = model_name
+        self.fingerprint = f"local-ce:{model_name}"
+        # Resolve the model path like LocalBgeEmbedder does.
+        repo_id = model_name
+        local_dir: Path | None = None
+        candidate = Path(model_name)
+        if not model_name.startswith(("./", "../", "/")) and candidate.exists():
+            local_dir = candidate
+        elif "/" in model_name and candidate.exists():
+            local_dir = candidate
+        if local_dir is None and model_name.startswith(("./", "../", "/")):
+            local_dir = _auto_download_model(model_name)
+        if local_dir is not None:
+            model_path = str(local_dir.resolve())
+        else:
+            for candidate_dir in (
+                Path("models") / repo_id,
+                Path("models") / repo_id.rsplit("/", 1)[-1],
+                Path("models") / repo_id.replace("/", "--"),
+            ):
+                if candidate_dir.exists():
+                    model_path = str(candidate_dir.resolve())
+                    break
+            else:
+                model_path = repo_id
+        self._model = CrossEncoder(model_path)
+
+    def rerank(
+        self, query: str, documents: Sequence[str], *, top_n: int | None = None
+    ) -> tuple[tuple[int, float], ...]:
+        if not documents:
+            return ()
+        pairs = [(query, doc) for doc in documents]
+        scores = self._model.predict(pairs, show_progress_bar=False)
+        # CrossEncoder returns raw scores; higher is better.
+        indexed = sorted(
+            enumerate(scores.tolist() if hasattr(scores, "tolist") else scores),
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        if top_n is not None:
+            indexed = indexed[:top_n]
+        return tuple((idx, float(score)) for idx, score in indexed)
+
+
 def serialize_vector(vector: Sequence[float]) -> bytes:
     """Encode an L2-normalized vector as explicit little-endian float32 values."""
 

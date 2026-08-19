@@ -112,6 +112,22 @@ The model is **downloaded automatically** from the Hugging Face mirror
 (hf-mirror.com) on first use — no manual download step is needed.
 To use a different model, set `MEMORIA_BGE_EMBEDDING_MODEL` (e.g. `BAAI/bge-m3`).
 
+## Reranker backends
+
+| Backend | Env var | Description | Dependencies |
+|---------|---------|-------------|-------------|
+| `none` | `MEMORIA_RERANKER_BACKEND=none` | No reranking (default) | None |
+| `local` | `MEMORIA_RERANKER_BACKEND=local` | **Local CrossEncoder (CPU)** | `pip install -e ".[bge]"` |
+| `bge` | `MEMORIA_RERANKER_BACKEND=bge` | Self-hosted BGE reranker API | External service |
+| `qwen` | `MEMORIA_RERANKER_BACKEND=qwen` | Alibaba Cloud Qwen reranker | `DASHSCOPE_API_KEY` |
+| `gpt4o` | `MEMORIA_RERANKER_BACKEND=gpt4o` | GPT-4o-mini as pointwise reranker | `OPENAI_API_KEY` |
+
+The `local` reranker mirrors InvMem's approach: loads
+`cross-encoder/ms-marco-MiniLM-L-6-v2` (~88 MB, CPU) via
+sentence-transformers `CrossEncoder`. It reranks the top 500 candidates
+from the search pipeline by scoring each (query, document) pair. The model
+is **downloaded automatically** from hf-mirror.com on first use.
+
 ## Dimension regression testing
 
 The `memoria-dimension-eval` CLI targets each of the 7 AML evaluation
@@ -133,10 +149,12 @@ MEMORIA_AUTH_SCHEME=none memoria-dimension-eval --report-out baseline.json
 The repo ships `eval.sh` with all reproduction commands:
 
 ```bash
-./eval.sh              # 维度评测（纯词法）
-./eval.sh local        # 维度评测（本地 BGE 混合）
-./eval.sh full         # LoCoMo 完整基准（纯词法，自动下载数据）
-./eval.sh full local   # LoCoMo 完整基准（本地 BGE 混合）
+./eval.sh                                      # 维度评测（纯词法）
+./eval.sh local                                # 维度评测（本地 BGE 混合）
+./eval.sh --reranker local                     # 维度评测（CrossEncoder 重排）
+./eval.sh local --reranker local               # 维度评测（BGE + CrossEncoder）
+./eval.sh full                                 # LoCoMo 完整基准（纯词法）
+./eval.sh full local                           # LoCoMo 完整基准（本地 BGE 混合）
 ```
 
 The report shows per-dimension Recall@100, MRR, and nDCG, plus an overall

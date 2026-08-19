@@ -345,6 +345,10 @@ def create_reranker(
 ) -> QwenReranker | None:
     if backend == "none":
         return None
+    if backend == "local":
+        from memoria.embeddings import LocalCrossEncoder
+
+        return LocalCrossEncoder(model_name=model)
     if api_key is None:
         raise ValueError("remote reranker API key is required")
     if backend == "qwen":
@@ -380,7 +384,7 @@ def create_reranker(
             retries=retries,
             recorder=recorder,
         )
-    raise ValueError("MEMORIA_RERANKER_BACKEND must be none, qwen, bge, or gpt4o")
+    raise ValueError("MEMORIA_RERANKER_BACKEND must be none, qwen, bge, gpt4o, or local")
 
 
 def _join_url(base_url: str, suffix: str) -> str:

@@ -2,10 +2,12 @@
 # ============================================================================
 # memoria 一键评测脚本
 # 用法:
-#   ./eval.sh                  # 纯词法维度评测
-#   ./eval.sh local            # 本地 BGE 混合维度评测
-#   ./eval.sh full             # LoCoMo 完整基准（纯词法）
-#   ./eval.sh full local       # LoCoMo 完整基准（本地 BGE 混合）
+#   ./eval.sh                         # 纯词法维度评测
+#   ./eval.sh local                   # 本地 BGE 混合维度评测
+#   ./eval.sh --reranker local        # CrossEncoder 重排维度评测
+#   ./eval.sh local --reranker local  # BGE + CrossEncoder 维度评测
+#   ./eval.sh full                    # LoCoMo 完整基准（纯词法）
+#   ./eval.sh full local              # LoCoMo 完整基准（本地 BGE 混合）
 # ============================================================================
 set -euo pipefail
 
@@ -21,43 +23,58 @@ fi
 export MEMORIA_AUTH_SCHEME=none
 
 run_dimension_eval() {
-    local backend="$1"
-    local label="$2"
+    local embed_backend="$1"
+    shift
     echo "───────────────────────────────────────────────"
-    echo "  维度评测: $label"
+    echo "  维度评测: embed=$embed_backend  $*"
     echo "───────────────────────────────────────────────"
     rm -rf .dimension-eval-cache
-    if [ "$backend" = "none" ]; then
-        .venv/bin/memoria-dimension-eval
-    else
-        .venv/bin/memoria-dimension-eval --embedding-backend "$backend"
-    fi
+    .venv/bin/memoria-dimension-eval --embedding-backend "$embed_backend" "$@"
     echo ""
 }
 
 run_full_benchmark() {
-    local backend="$1"
-    local label="$2"
+    local embed_backend="$1"
+    shift
     echo "───────────────────────────────────────────────"
-    echo "  LoCoMo 完整基准: $label"
+    echo "  LoCoMo 完整基准: embed=$embed_backend  $*"
     echo "───────────────────────────────────────────────"
     rm -rf /tmp/memoria_bench/db
-    if [ "$backend" = "none" ]; then
-        .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
-        .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
-    else
-        MEMORIA_EMBEDDING_BACKEND="$backend" .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
-        MEMORIA_EMBEDDING_BACKEND="$backend" .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
-    fi
+    MEMORIA_EMBEDDING_BACKEND="$embed_backend" .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
+    MEMORIA_EMBEDDING_BACKEND="$embed_backend" .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
     echo ""
 }
 
 # ── 解析参数 ──────────────────────────────────────────────────────────────
-MODE="${1:-dimension}"   # dimension | full
-BACKEND="${2:-none}"     # none | local
+MODE="dimension"
+EMBED="none"
+RERANKER="none"
+POSITIONAL=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        dimension|full)
+            MODE="$1"
+            ;;
+        none|local|hashing)
+            EMBED="$1"
+            ;;
+        --reranker)
+            RERANKER="${2:-none}"
+            shift
+            ;;
+        *)
+            echo "❌ 未知参数: $1"
+            echo "用法: $0 [dimension|full] [none|local|hashing] [--reranker none|local]"
+            exit 1
+            ;;
+    esac
+    shift
+done
 
 if [ "$MODE" = "dimension" ]; then
-    run_dimension_eval "$BACKEND" "$BACKEND"
+    ARGS=()
+    [ "$RERANKER" != "none" ] && ARGS+=(--reranker-backend "$RERANKER")
+    run_dimension_eval "$EMBED" "${ARGS[@]}"
 elif [ "$MODE" = "full" ]; then
     # 检查 LoCoMo 数据是否已准备
     if [ ! -f /tmp/memoria_bench/adds.jsonl ]; then
@@ -73,8 +90,8 @@ elif [ "$MODE" = "full" ]; then
             --adds-out /tmp/memoria_bench/adds.jsonl \
             --eval-out /tmp/memoria_bench/eval.jsonl
     fi
-    run_full_benchmark "$BACKEND" "$BACKEND"
+    run_full_benchmark "$EMBED"
 else
-    echo "用法: $0 [dimension|full] [none|local]"
+    echo "用法: $0 [dimension|full] [none|local|hashing] [--reranker none|local]"
     exit 1
 fi

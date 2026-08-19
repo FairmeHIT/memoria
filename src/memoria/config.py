@@ -11,9 +11,9 @@ from dotenv import load_dotenv
 AuthScheme = Literal["none", "token", "bearer", "x_api_key"]
 VALID_AUTH_SCHEMES: frozenset[str] = frozenset({"none", "token", "bearer", "x_api_key"})
 EmbeddingBackend = Literal["none", "hashing", "qwen", "bge", "local"]
-RerankerBackend = Literal["none", "qwen", "bge", "gpt4o"]
+RerankerBackend = Literal["none", "qwen", "bge", "gpt4o", "local"]
 VALID_EMBEDDING_BACKENDS: frozenset[str] = frozenset({"none", "hashing", "qwen", "bge", "local"})
-VALID_RERANKER_BACKENDS: frozenset[str] = frozenset({"none", "qwen", "bge", "gpt4o"})
+VALID_RERANKER_BACKENDS: frozenset[str] = frozenset({"none", "qwen", "bge", "gpt4o", "local"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +62,7 @@ class Settings:
         if not 1 <= self.rrf_k <= 1_000:
             raise ValueError("MEMORIA_RRF_K must be between 1 and 1000")
         if self.reranker_backend not in VALID_RERANKER_BACKENDS:
-            raise ValueError("MEMORIA_RERANKER_BACKEND must be none, qwen, bge, or gpt4o")
+            raise ValueError("MEMORIA_RERANKER_BACKEND must be none, qwen, bge, gpt4o, or local")
         if self.embedding_backend == "qwen" and (
             not self.qwen_api_key or not self.embedding_base_url.strip() or not self.embedding_model.strip()
         ):
@@ -131,7 +131,9 @@ class Settings:
                 else ("MEMORIA_GPT4O_MODEL" if reranker_backend == "gpt4o" else "MEMORIA_RERANKER_MODEL"),
                 "BAAI/bge-reranker-v2-m3"
                 if reranker_backend == "bge"
-                else ("gpt-4o-mini" if reranker_backend == "gpt4o" else "qwen3-rerank"),
+                else ("gpt-4o-mini" if reranker_backend == "gpt4o" else (
+                    "cross-encoder/ms-marco-MiniLM-L-6-v2" if reranker_backend == "local" else "qwen3-rerank"
+                )),
             ),
             reranker_base_url=(
                 bge_base_url if reranker_backend == "bge" else os.environ.get("MEMORIA_RERANKER_BASE_URL", "")

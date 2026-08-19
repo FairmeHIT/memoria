@@ -421,6 +421,12 @@ def main() -> None:
         help="Embedding backend to use (default: none = pure lexical)",
     )
     parser.add_argument(
+        "--reranker-backend",
+        default="none",
+        choices=("none", "local"),
+        help="Reranker backend to use (default: none, local = CrossEncoder)",
+    )
+    parser.add_argument(
         "--report-out",
         type=Path,
         help="Optional path to write JSON report",
@@ -439,6 +445,9 @@ def main() -> None:
         embedding_backend=args.embedding_backend,  # type: ignore[arg-type]
         embedding_dimensions=384,
         embedding_model="models/bge-small-en-v1.5" if args.embedding_backend == "local" else "text-embedding-v4",
+        reranker_backend=args.reranker_backend,  # type: ignore[arg-type]
+        reranker_model="models/cross-encoder-ms-marco-MiniLM-L-6-v2" if args.reranker_backend == "local" else "qwen3-rerank",
+        reranker_candidate_limit=500,
     )
     store = create_runtime_store(settings)
 
