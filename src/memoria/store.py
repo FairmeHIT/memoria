@@ -56,7 +56,7 @@ CONCEPT_GROUPS = (
     {"prefer", "preference", "favorite", "favourite", "like", "love", "enjoy"},
     {"job", "career", "profession", "occupation", "work", "employment"},
     {"education", "school", "study", "studies", "college", "university", "degree", "course", "training", "certification"},
-    {"home", "live", "lives", "living", "reside", "residence", "move", "moved", "location", "city", "country"},
+    {"home", "live", "lives", "living", "reside", "residence", "move", "moved", "location", "city", "country", "capital", "region", "state", "province"},
     {"trip", "travel", "journey", "vacation", "holiday", "roadtrip", "camping", "hiking"},
     {"buy", "bought", "purchase", "purchased", "order", "ordered", "get", "got"},
     {"book", "books", "read", "reading", "author", "novel", "bookshelf"},
@@ -73,6 +73,8 @@ CONCEPT_GROUPS = (
     {"before", "after", "earlier", "later", "first", "last", "sequence", "timeline"},
     {"art", "paint", "painting", "draw", "drawing", "pottery", "creative"},
     {"support", "help", "care", "counsel", "counseling", "therapy", "mental"},
+    {"hobby", "hobbies", "interest", "interests", "passion", "pastime", "leisure",
+ "like", "love", "enjoy", "read", "reading", "write", "writing", "create", "creative"},
 )
 
 # ──────────────────────────────────────────────── 时间意图标记
@@ -635,7 +637,7 @@ class MemoryStore:
             )
             # 程序性记忆 boosting：查询涉及偏好/习惯/流程时拉取匹配项
             procedural_boosts: dict[str, float] = self._procedural_boosts(
-                connection=connection, user_id=user_id, query=query
+                connection=connection, user_id=user_id, query=query, options=options or []
             )
         finally:
             connection.close()
@@ -861,7 +863,7 @@ class MemoryStore:
     ) -> list[sqlite3.Row]:
         # 扩展查询词：基础词形 + CJK n-gram + 概念同义词
         query_terms = _canonical_terms(query) | set(_cjk_ngrams(query)) | _concept_expansion(query)
-        option_terms = _canonical_terms(" ".join(options)) | set(_cjk_ngrams(" ".join(options)))
+        option_terms = {t for t in _canonical_terms(" ".join(options)) | set(_cjk_ngrams(" ".join(options))) if len(t) > 1}
         if not query_terms and not option_terms:
             return []
         rows = connection.execute(
@@ -1096,10 +1098,12 @@ class MemoryStore:
         connection: sqlite3.Connection,
         user_id: str,
         query: str,
+        options: Sequence[str] | None = None,
     ) -> dict[str, float]:
         """计算查询对程序性记忆的 boosting 分数。
 
         仅当查询本身涉及偏好/习惯/流程时才激活，避免干扰普通事实检索。
+        options（选项）也参与匹配：选项词是任务提示中的关键信号。
         """
         if not is_procedural_query(query):
             return {}
@@ -1112,6 +1116,7 @@ class MemoryStore:
             (user_id,),
         ).fetchall()
         q = query.casefold()
+        opt_text = " ".join(options or []).casefold()
         boosts: dict[str, float] = {}
         for row in rows:
             score = 0.0
@@ -1119,11 +1124,11 @@ class MemoryStore:
             entity = str(row["entity"] or "").casefold()
             trigger = str(row["trigger_text"] or "").casefold()
             statement = str(row["statement"] or "").casefold()
-            if entity and entity in q:
+            if entity and (entity in q or entity in opt_text):
                 score += 0.30
-            if trigger and trigger in q:
+            if trigger and (trigger in q or trigger in opt_text):
                 score += 0.20
-            if statement and statement in q:
+            if statement and (statement in q or statement in opt_text):
                 score += 0.15
             # 偏好型记忆基础 boost：procedural 查询天然偏好这类记忆
             if proc_type in ("preference", "routine"):
@@ -1504,7 +1509,7 @@ def _rank_memory(
     recency_score: float = 0.0,
     temporal_intent: str = "none",
 ) -> RankedMemory:
-    query_terms = _canonical_terms(query)
+    query_terms = _canonical_terms(query) | _concept_expansion(query)
     content_terms = _canonical_terms(str(row["content"]))
     coverage_score = len(query_terms & content_terms) / len(query_terms) if query_terms else 0.0
     # 增强选项模式：取每个选项单独覆盖度的最大值
@@ -1514,7 +1519,7 @@ def _rank_memory(
             for opt in options
         ) if options else 0.0
     else:
-        option_terms = _canonical_terms(" ".join(options))
+        option_terms = {t for t in _canonical_terms(" ".join(options)) if len(t) > 1}
         option_coverage = len(option_terms & content_terms) / len(option_terms) if option_terms else 0.0
     bm25_score = float(row["bm25_score"])
     lexical_score = 1.0 / (1.0 + abs(bm25_score))
@@ -1556,8 +1561,9 @@ def _candidate_ranks(
 ) -> dict[str, int]:
     """Order lexical candidates before reciprocal-rank fusion."""
 
-    query_terms = _canonical_terms(query)
-    option_terms = _canonical_terms(" ".join(options))
+    query_terms = _canonical_terms(query) | _concept_expansion(query)
+    # 过滤单字符选项 token（如 "A. Peanuts" 中的 "a"/"b"），避免污染排名
+    option_terms = {t for t in _canonical_terms(" ".join(options)) if len(t) > 1}
 
     def score(row: sqlite3.Row) -> tuple[float, str, str]:
         content = str(row["content"])
