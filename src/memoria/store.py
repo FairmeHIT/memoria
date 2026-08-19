@@ -714,7 +714,8 @@ class MemoryStore:
 
     def _apply_reranker(self, query: str, ranked: list[RankedMemory]) -> list[RankedMemory]:
         # CrossEncoder (ms-marco) 是纯英文模型，中文查询跳过 CE 以免疫乱
-        if CJK_RE.search(query):
+        # 多语言模型（bge-reranker-v2-m3）或路由模型不受此限制
+        if CJK_RE.search(query) and not getattr(self._reranker, "supports_cjk", True):
             return ranked
         temporal_intent = _detect_temporal_intent(query)
         candidates = ranked[: self._settings.reranker_candidate_limit]

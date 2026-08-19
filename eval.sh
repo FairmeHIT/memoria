@@ -25,11 +25,20 @@ export MEMORIA_AUTH_SCHEME=none
 run_dimension_eval() {
     local embed_backend="$1"
     shift
+    local use_routing="$1"
+    shift
     echo "───────────────────────────────────────────────"
-    echo "  维度评测: embed=$embed_backend  $*"
+    echo "  维度评测: embed=$embed_backend  routing=$use_routing  $*"
     echo "───────────────────────────────────────────────"
     rm -rf .dimension-eval-cache
-    .venv/bin/memoria-dimension-eval --embedding-backend "$embed_backend" "$@"
+    if [ "$use_routing" = "1" ]; then
+        # 语言路由：英文 ms-marco，中文 bge-reranker-v2-m3
+        .venv/bin/memoria-dimension-eval --embedding-backend "$embed_backend" \
+            --reranker-backend local \
+            --reranker-multilingual "models/bge-reranker-v2-m3" "$@"
+    else
+        .venv/bin/memoria-dimension-eval --embedding-backend "$embed_backend" "$@"
+    fi
     echo ""
 }
 
@@ -43,12 +52,12 @@ run_full_benchmark() {
     MEMORIA_EMBEDDING_BACKEND="$embed_backend" \
     MEMORIA_RERANKER_BACKEND="$RERANKER" \
     MEMORIA_BGE_EMBEDDING_MODEL="models/bge-small-en-v1.5" \
-    MEMORIA_RERANKER_MODEL="models/cross-encoder-ms-marco-MiniLM-L-6-v2" \
+    MEMORIA_RERANKER_MODEL="models/bge-reranker-v2-m3" \
     .venv/bin/memoria-load --data /tmp/memoria_bench/adds.jsonl --data-dir /tmp/memoria_bench/db > /dev/null 2>&1
     MEMORIA_EMBEDDING_BACKEND="$embed_backend" \
     MEMORIA_RERANKER_BACKEND="$RERANKER" \
     MEMORIA_BGE_EMBEDDING_MODEL="models/bge-small-en-v1.5" \
-    MEMORIA_RERANKER_MODEL="models/cross-encoder-ms-marco-MiniLM-L-6-v2" \
+    MEMORIA_RERANKER_MODEL="models/bge-reranker-v2-m3" \
     .venv/bin/memoria-evaluate --data /tmp/memoria_bench/eval.jsonl --data-dir /tmp/memoria_bench/db
     echo ""
 }
@@ -81,8 +90,13 @@ done
 
 if [ "$MODE" = "dimension" ]; then
     ARGS=()
-    [ "$RERANKER" != "none" ] && ARGS+=(--reranker-backend "$RERANKER")
-    run_dimension_eval "$EMBED" "${ARGS[@]}"
+    ROUTING=0
+    if [ "$RERANKER" = "local" ]; then
+        ROUTING=1
+    elif [ "$RERANKER" != "none" ]; then
+        ARGS+=(--reranker-backend "$RERANKER")
+    fi
+    run_dimension_eval "$EMBED" "$ROUTING" "${ARGS[@]}"
 elif [ "$MODE" = "full" ]; then
     # 检查 LoCoMo 数据是否已准备
     if [ ! -f /tmp/memoria_bench/adds.jsonl ]; then

@@ -427,6 +427,12 @@ def main() -> None:
         help="Reranker backend to use (default: none, local = CrossEncoder)",
     )
     parser.add_argument(
+        "--reranker-multilingual",
+        default=None,
+        help="Optional multilingual reranker model path for CJK queries "
+        "(enables language routing; requires --reranker-backend local)",
+    )
+    parser.add_argument(
         "--report-out",
         type=Path,
         help="Optional path to write JSON report",
@@ -446,8 +452,11 @@ def main() -> None:
         embedding_dimensions=384,
         embedding_model="models/bge-small-en-v1.5" if args.embedding_backend == "local" else "text-embedding-v4",
         reranker_backend=args.reranker_backend,  # type: ignore[arg-type]
-        reranker_model="models/cross-encoder-ms-marco-MiniLM-L-6-v2" if args.reranker_backend == "local" else "qwen3-rerank",
-        reranker_candidate_limit=500,
+        reranker_model="models/cross-encoder-ms-marco-MiniLM-L-6-v2"
+        if args.reranker_backend == "local"
+        else "qwen3-rerank",
+        reranker_multilingual_model=args.reranker_multilingual or "",
+        reranker_candidate_limit=100,
     )
     store = create_runtime_store(settings)
 

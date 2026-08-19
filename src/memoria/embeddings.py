@@ -12,6 +12,9 @@ from typing import Protocol
 from memoria.model_audit import ModelCallAudit
 
 
+# 中文 CJK 正则，用于双模型路由判断
+_CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]+")
 
 
@@ -260,17 +263,22 @@ class LocalCrossEncoder:
     model_name can be a HuggingFace repo ID or a local path. When the path
     does not exist, the model is downloaded automatically from the Hugging
     Face mirror first.
+
+    instruction (optional): prefix prepended to the query (e.g. for BGE
+    reranker models that require a task instruction).
     """
 
     def __init__(
         self,
         *,
         model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        instruction: str = "",
     ) -> None:
-        from sentence_transformers import CrossEncoder
-
         self.model_name = model_name
+        self.instruction = instruction
         self.fingerprint = f"local-ce:{model_name}"
+        # 纯英文模型（ms-marco）不支持中文查询；多语言模型不受限
+        self.supports_cjk = "ms-marco" not in model_name
         # Resolve the model path like LocalBgeEmbedder does.
         repo_id = model_name
         local_dir: Path | None = None
@@ -294,14 +302,53 @@ class LocalCrossEncoder:
                     break
             else:
                 model_path = repo_id
-        self._model = CrossEncoder(model_path)
+        # num_labels=1 的模型（如 BGE reranker v2-m3）需要在 logits 空间
+        # 排序；sigmoid 会压缩分数导致难以区分。用 transformers 直接推理。
+        try:
+            from transformers import AutoConfig
+
+            config = AutoConfig.from_pretrained(model_path)
+            use_raw_logits = int(getattr(config, "num_labels", 1)) == 1
+        except Exception:
+            use_raw_logits = False
+        self._use_raw_logits = use_raw_logits
+        if use_raw_logits:
+            from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+            self._rf_model = AutoModelForSequenceClassification.from_pretrained(model_path)
+            self._rf_tokenizer = AutoTokenizer.from_pretrained(model_path)
+            self._model = None  # type: ignore[assignment]
+        else:
+            from sentence_transformers import CrossEncoder
+
+            self._model = CrossEncoder(model_path)
+            self._rf_model = None  # type: ignore[assignment]
+            self._rf_tokenizer = None  # type: ignore[assignment]
 
     def rerank(
         self, query: str, documents: Sequence[str], *, top_n: int | None = None
     ) -> tuple[tuple[int, float], ...]:
         if not documents:
             return ()
-        pairs = [(query, doc) for doc in documents]
+        q = f"{self.instruction} {query}".strip() if self.instruction else query
+        if self._use_raw_logits:
+            import torch
+
+            pairs = [(q, doc) for doc in documents]
+            inputs = self._rf_tokenizer(
+                pairs, padding=True, truncation=True, return_tensors="pt"
+            )
+            with torch.no_grad():
+                logits = self._rf_model(**inputs).logits
+            if logits.shape[-1] == 1:
+                scores = logits.squeeze(-1).tolist()
+            else:
+                scores = logits[:, 0].tolist()
+            indexed = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
+            if top_n is not None:
+                indexed = indexed[:top_n]
+            return tuple((idx, float(score)) for idx, score in indexed)
+        pairs = [(q, doc) for doc in documents]
         scores = self._model.predict(pairs, show_progress_bar=False)
         # CrossEncoder returns raw scores; higher is better.
         indexed = sorted(
@@ -312,6 +359,34 @@ class LocalCrossEncoder:
         if top_n is not None:
             indexed = indexed[:top_n]
         return tuple((idx, float(score)) for idx, score in indexed)
+
+
+class RoutingCrossEncoder:
+    """按查询语言路由的 CrossEncoder 组合。
+
+    英文/拉丁查询交给 ms-marco（对记忆治理、偏好等维度得分稳定），
+    中文等 CJK 查询交给多语言模型（bge-reranker-v2-m3），两者共享
+    相同的 rerank() 接口。score 空间因模型不同而异，调用方应做
+    min-max 归一化（store._apply_reranker 已处理）。
+    """
+
+    def __init__(
+        self,
+        *,
+        english_model: LocalCrossEncoder,
+        multilingual_model: LocalCrossEncoder,
+    ) -> None:
+        self._english = english_model
+        self._multilingual = multilingual_model
+        self.fingerprint = f"route:{english_model.fingerprint}|{multilingual_model.fingerprint}"
+        self.supports_cjk = True
+
+    def rerank(
+        self, query: str, documents: Sequence[str], *, top_n: int | None = None
+    ) -> tuple[tuple[int, float], ...]:
+        if _CJK_RE.search(query):
+            return self._multilingual.rerank(query, documents, top_n=top_n)
+        return self._english.rerank(query, documents, top_n=top_n)
 
 
 def serialize_vector(vector: Sequence[float]) -> bytes:

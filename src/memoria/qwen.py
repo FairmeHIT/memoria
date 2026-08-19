@@ -342,13 +342,21 @@ def create_reranker(
     instruct: str | None,
     recorder: ModelCallRecorder | None = None,
     auth_scheme: str = "bearer",
+    multilingual_model: str = "",
 ) -> QwenReranker | None:
     if backend == "none":
         return None
     if backend == "local":
-        from memoria.embeddings import LocalCrossEncoder
+        from pathlib import Path
 
-        return LocalCrossEncoder(model_name=model)
+        from memoria.embeddings import LocalCrossEncoder, RoutingCrossEncoder
+
+        english = LocalCrossEncoder(model_name=model, instruction=instruct or "")
+        # 多语言模型存在时启用语言路由：英文走主模型，CJK 走多语言模型
+        if multilingual_model and Path(multilingual_model).exists():
+            multi = LocalCrossEncoder(model_name=multilingual_model, instruction=instruct or "")
+            return RoutingCrossEncoder(english_model=english, multilingual_model=multi)
+        return english
     if api_key is None:
         raise ValueError("remote reranker API key is required")
     if backend == "qwen":

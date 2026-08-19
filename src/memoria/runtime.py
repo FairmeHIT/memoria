@@ -46,6 +46,7 @@ def create_runtime_store(settings: Settings) -> MemoryStore:
             instruct=settings.reranker_instruct,
             recorder=recorder,
             auth_scheme=settings.model_auth_scheme if settings.reranker_backend == "bge" else "bearer",
+            multilingual_model=settings.reranker_multilingual_model,
         ),
     )
     store.initialize()

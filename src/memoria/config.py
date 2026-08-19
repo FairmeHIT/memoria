@@ -33,6 +33,7 @@ class Settings:
     embedding_base_url: str = ""
     reranker_backend: RerankerBackend = "none"
     reranker_model: str = "qwen3-rerank"
+    reranker_multilingual_model: str = ""
     reranker_base_url: str = ""
     reranker_candidate_limit: int = 500
     reranker_instruct: str | None = "Given a web search query, retrieve relevant passages that answer the query."
@@ -132,12 +133,13 @@ class Settings:
                 "BAAI/bge-reranker-v2-m3"
                 if reranker_backend == "bge"
                 else ("gpt-4o-mini" if reranker_backend == "gpt4o" else (
-                    "cross-encoder/ms-marco-MiniLM-L-6-v2" if reranker_backend == "local" else "qwen3-rerank"
+                    "models/bge-reranker-v2-m3" if reranker_backend == "local" else "qwen3-rerank"
                 )),
             ),
             reranker_base_url=(
                 bge_base_url if reranker_backend == "bge" else os.environ.get("MEMORIA_RERANKER_BASE_URL", "")
             ),
+            reranker_multilingual_model=os.environ.get("MEMORIA_RERANKER_MULTILINGUAL_MODEL", ""),
             reranker_candidate_limit=int(os.environ.get("MEMORIA_RERANKER_CANDIDATE_LIMIT", "500")),
             reranker_instruct=os.environ.get(
                 "MEMORIA_RERANKER_INSTRUCT",
