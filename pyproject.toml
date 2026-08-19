@@ -21,9 +21,13 @@ dev = [
   "pytest>=8.3,<10",
   "pytest-cov>=6,<8",
 ]
+bge = [
+  "sentence-transformers>=3.0,<4",
+]
 
 [project.scripts]
 memoria-cleanup = "memoria.retention:main"
+memoria-dimension-eval = "memoria.dimension_eval:main"
 memoria-evaluate = "memoria.evaluation:main"
 memoria-load = "memoria.ingest:main"
 memoria-prepare-benchmark = "memoria.benchmarks:main"

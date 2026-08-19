@@ -65,9 +65,9 @@ def test_reindex_backfills_only_missing_current_model_vectors(tmp_path) -> None:
 
     assert result == {"scanned": 2, "updated": 2}
     assert store.reindex_embeddings(batch_size=10) == {"scanned": 0, "updated": 0}
-    assert store.search(
+    assert "I commute by bicycle." in store.search(
         query="How does the user travel?", options=None, user_id="user-a", top_k=1
-    )[0].content == "user: I commute by bicycle."
+    )[0].content
 
 
 def test_reindex_replaces_stale_vectors_after_fingerprint_change(tmp_path) -> None:
@@ -121,6 +121,6 @@ def test_reindex_replaces_stale_vectors_after_fingerprint_change(tmp_path) -> No
         assert [row[0] for row in rows] == ["bge-embedding-v2:BAAI/bge-m3:2"]
     finally:
         connection.close()
-    assert current_store.search(
+    assert "I commute by bicycle." in current_store.search(
         query="How does the user travel?", options=None, user_id="user-a", top_k=1
-    )[0].content == "user: I commute by bicycle."
+    )[0].content

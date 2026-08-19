@@ -1,4 +1,6 @@
-"""SQLite persistence, idempotent ingestion, FTS retrieval, and retention."""
+"""SQLite persistence, idempotent ingestion, FTS retrieval, and retention.
+Optimized for AML Leaderboard: Chinese n-gram, temporal intent, concept expansion.
+"""
 from __future__ import annotations
 
 import hashlib
@@ -11,14 +13,106 @@ from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from memoria.claims import Claim, extract_claims
 from memoria.config import Settings
 from memoria.embeddings import EmbeddingProvider, EmbeddingUnavailable, deserialize_vector, serialize_vector
 from memoria.schemas import AddRequest, AddResponse, SearchHit
 
+# ────────────────────────────────────────────────────────────── 权重常量
+W_RRF_LEXICAL = 0.6          # 词法 RRF 权重
+W_RRF_VECTOR = 0.4           # 向量 RRF 权重
+W_VECTOR_SIM = 0.35          # 向量相似度权重
+W_COVERAGE = 0.10            # 查询词覆盖率权重
+W_OPTION_COVERAGE = 0.02     # 选项词覆盖率权重
+W_EXACT_BOOST = 0.04         # 精确子串加分
+W_LEXICAL_FALLBACK = 0.2     # 非混合模式下的精确子串权重
+W_EXACT_FALLBACK = 0.2       # 非混合模式下的精确子串加成
+W_OPTION_FALLBACK = 0.2      # 非混合模式下的选项覆盖率权重
+W_RECENCY_LATEST = 0.10      # "最新"意图时的新近度加分
+W_RECENCY_EARLIEST = 0.10    # "最早"意图时的旧度加分
+W_TIMEPOINT_MILD = 0.025     # 时间点/序列问题的基础加分
+CONTEXT_RADIUS = 2           # 邻接上下文窗口半径（会话内前后 N 条）
+CONTEXT_MAX_CHARS = 2000     # 上下文扩展的最大字符数
+TEMPORAL_ENRICHMENT = True   # 是否在证据中附加角色 + 日期前缀（InvMem 风格）
+ENHANCED_OPTIONS = True      # 是否使用增强选项查询视图（InvMem enhanced 模式）
 
+# ────────────────────────────────────────────────────────────── 中文处理
+CJK_RE = re.compile(r"[\u4e00-\u9fff]+")
+CJK_STOPWORDS = frozenset({
+    "的", "了", "在", "是", "我", "有", "和", "就", "不", "人", "都",
+    "一", "一个", "上", "也", "很", "到", "说", "要", "去", "你",
+    "会", "着", "没有", "看", "好", "自己", "这", "他", "她", "它",
+    "们", "那", "什么", "怎么", "为什么", "哪个", "多少", "如何",
+    "这个", "那个", "我们", "你们", "他们", "她们", "目前", "现在",
+    "当前", "最新", "最近", "之前", "之后", "以前", "后来",
+})
+
+# ────────────────────────────────────────────────────────────── 概念语义组
+CONCEPT_GROUPS = (
+    {"prefer", "preference", "favorite", "favourite", "like", "love", "enjoy"},
+    {"job", "career", "profession", "occupation", "work", "employment"},
+    {"education", "school", "study", "studies", "college", "university", "degree", "course", "training", "certification"},
+    {"home", "live", "lives", "living", "reside", "residence", "move", "moved", "location", "city", "country"},
+    {"trip", "travel", "journey", "vacation", "holiday", "roadtrip", "camping", "hiking"},
+    {"buy", "bought", "purchase", "purchased", "order", "ordered", "get", "got"},
+    {"book", "books", "read", "reading", "author", "novel", "bookshelf"},
+    {"music", "song", "songs", "listen", "listening", "artist", "band", "composer"},
+    {"child", "children", "kid", "kids", "son", "daughter", "family", "parent"},
+    {"friend", "friends", "relationship", "partner", "married", "single"},
+    {"health", "medical", "doctor", "physician", "medicine", "medication", "hospital", "clinic"},
+    {"food", "meal", "eat", "eating", "restaurant", "dish", "cuisine"},
+    {"sport", "sports", "exercise", "workout", "gym", "run", "running", "race"},
+    {"movie", "film", "show", "series", "watch", "watched"},
+    {"birthday", "born", "birth", "age", "old"},
+    {"plan", "planning", "intend", "intention", "goal", "want", "decide", "decided"},
+    {"change", "changed", "update", "updated", "correct", "correction", "instead", "now", "current", "latest"},
+    {"before", "after", "earlier", "later", "first", "last", "sequence", "timeline"},
+    {"art", "paint", "painting", "draw", "drawing", "pottery", "creative"},
+    {"support", "help", "care", "counsel", "counseling", "therapy", "mental"},
+)
+
+# ──────────────────────────────────────────────── 时间意图标记
+TemporalIntent = Literal["none", "latest", "earliest", "sequence", "point"]
+
+LATEST_MARKERS = frozenset({
+    "latest", "last", "recent", "current", "currently", "now", "newest", "final",
+    "most recent", "up to date", "as of",
+    "最近", "最新", "最后", "当前", "现在", "目前", "最终",
+})
+EARLIEST_MARKERS = frozenset({
+    "first", "earliest", "initial", "originally", "at first",
+    "最早", "首先", "第一次", "起初", "原先",
+})
+SEQUENCE_MARKERS = frozenset({
+    "before", "after", "earlier", "later", "timeline", "sequence", "order", "previous", "next", "subsequent",
+    "之前", "之后", "此前", "此后", "后来", "时间线", "顺序", "先后",
+})
+POINT_MARKERS = frozenset({
+    "when", "date", "time", "year", "month", "day",
+    "什么时候", "何时", "日期", "时间",
+})
+
+# ──────────────────────────────────────────────── 相对时间解析
+RELATIVE_TIME_PATTERNS = (
+    (r"\byesterday\b", lambda n: n - timedelta(days=1)),
+    (r"\blast night\b", lambda n: n - timedelta(days=1)),
+    (r"\btoday\b", lambda n: n),
+    (r"\btonight\b", lambda n: n),
+    (r"\btomorrow\b", lambda n: n + timedelta(days=1)),
+    (r"\blast week\b", lambda n: n - timedelta(weeks=1)),
+    (r"\bthis week\b", lambda n: n),
+    (r"\bnext week\b", lambda n: n + timedelta(weeks=1)),
+    (r"\blast month\b", lambda n: n - timedelta(days=30)),
+    (r"\bthis month\b", lambda n: n),
+    (r"\bnext month\b", lambda n: n + timedelta(days=30)),
+    (r"\blast year\b", lambda n: n - timedelta(days=365)),
+    (r"\bthis year\b", lambda n: n),
+    (r"\bnext year\b", lambda n: n + timedelta(days=365)),
+)
+
+# ──────────────────────────────────────────────── Schema
 SCHEMA = """
 PRAGMA foreign_keys = ON;
 
@@ -127,7 +221,13 @@ CREATE INDEX IF NOT EXISTS model_audit_created_at_idx ON model_audit(created_at)
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
     memory_id UNINDEXED,
     content,
-    tokenize='unicode61'
+    tokenize='unicode61 remove_diacritics 2'
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts_porter USING fts5(
+    memory_id UNINDEXED,
+    content,
+    tokenize='porter unicode61 remove_diacritics 2'
 );
 """
 
@@ -175,6 +275,14 @@ class MemoryStore:
             connection = self._connect(enable_wal=True)
             try:
                 connection.executescript(SCHEMA)
+                # 回填 porter FTS 表：已有 memories 但未进 porter 表的
+                connection.execute("""
+                    INSERT INTO memories_fts_porter (memory_id, content)
+                    SELECT m.id, m.content FROM memories m
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM memories_fts_porter p WHERE p.memory_id = m.id
+                    )
+                """)
             finally:
                 connection.close()
 
@@ -271,6 +379,10 @@ class MemoryStore:
                     )
                     connection.execute(
                         "INSERT INTO memories_fts (memory_id, content) VALUES (?, ?)",
+                        (memory_id, evidence),
+                    )
+                    connection.execute(
+                        "INSERT INTO memories_fts_porter (memory_id, content) VALUES (?, ?)",
                         (memory_id, evidence),
                     )
                     if vectors is not None:
@@ -407,7 +519,8 @@ class MemoryStore:
         """Return only user-scoped, deduplicated evidence in stable score order."""
 
         started = time.perf_counter()
-        primary_expression = _fts_expression(query)
+        temporal_intent = _detect_temporal_intent(query)
+        primary_expression = _fts_expression(query, temporal_intent=temporal_intent)
         option_expression = _fts_expression(" ".join(options or []))
         query_vector = self._embed_query(query)
         if not primary_expression and not option_expression and query_vector is None:
@@ -460,15 +573,18 @@ class MemoryStore:
                 {str(row["id"]): row for row in vector_rows if str(row["id"]) not in rows_by_id}
             )
             rows = list(rows_by_id.values())
+            # 历史/最早意图 → 不过滤覆写（保留旧记录）
+            historical = temporal_intent == "earliest" or _is_historical_query(query)
             superseded_ids = (
                 set()
-                if _is_historical_query(query)
+                if historical
                 else self._superseded_memory_ids(connection, [str(row["id"]) for row in rows])
             )
         finally:
             connection.close()
 
-        recency_scores = _recency_scores(rows) if _is_current_query(query) else {}
+        # 总是计算 recency 分数，由 _rank_memory 根据意图决定使用方式
+        recency_scores = _recency_scores(rows)
         lexical_ranks = _candidate_ranks(lexical_rows, query, options or [])
         vector_ranks = {
             str(row["id"]): rank for rank, row in enumerate(vector_rows, start=1)
@@ -485,6 +601,7 @@ class MemoryStore:
                     rrf_k=self._settings.rrf_k,
                     hybrid=self._embedder is not None,
                     recency_score=recency_scores.get(str(row["id"]), 0.0),
+                    temporal_intent=temporal_intent,
                 )
                 for row in rows
                 if str(row["id"]) not in superseded_ids
@@ -500,16 +617,22 @@ class MemoryStore:
             if item.content_hash in seen_content_hashes:
                 continue
             seen_content_hashes.add(item.content_hash)
+            # 时间富化证据格式（InvMem 风格）：[role | Message date: ...] content
+            role, raw_content = _extract_role_from_evidence(item.content)
+            content = _format_evidence(role, raw_content, item.created_at)
             selected.append(
                 SearchHit(
                     id=item.id,
-                    content=item.content,
+                    content=content,
                     score=round(item.score, 6),
                     created_at=item.created_at,
                 )
             )
             if len(selected) == top_k:
                 break
+        # 上下文窗口扩展：对选中的结果展开同 session 邻接消息
+        if selected and CONTEXT_RADIUS > 0:
+            selected = self._expand_context(selected, user_id)
         self._record_search_audit(
             user_id=user_id,
             query=query,
@@ -543,6 +666,84 @@ class MemoryStore:
             reranked.append(replace(item, score=fallback_score))
         return reranked
 
+    def _expand_context(self, selected: list[SearchHit], user_id: str) -> list[SearchHit]:
+        """Expand each selected hit with adjacent messages from the same session.
+        This gives the downstream answer model conversational context.
+        """
+        if not selected:
+            return selected
+        # 按创建时间排序，提取 session_id → [memory_id, created_at, content] 映射
+        memory_ids = [item.id for item in selected]
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.id, m.session_id, m.created_at, m.content, m.content_hash
+                FROM memories m
+                WHERE m.user_id = ? AND m.id IN ({})
+                """.format(",".join("?" for _ in memory_ids)),
+                (user_id, *memory_ids),
+            ).fetchall()
+
+        # 对每个选中的记忆，找到同 session 的前后 CONTEXT_RADIUS 条
+        session_map: dict[str, list[dict]] = {}
+        for row in rows:
+            sid = str(row["session_id"])
+            session_map.setdefault(sid, []).append({
+                "id": str(row["id"]),
+                "created_at": str(row["created_at"]),
+                "content": str(row["content"]),
+                "content_hash": str(row["content_hash"]),
+            })
+        # 对每个 session 按时间排序
+        for sid in session_map:
+            session_map[sid].sort(key=lambda r: r["created_at"])
+
+        # 扩展
+        id_to_pos: dict[str, tuple[str, int]] = {}
+        for sid, items in session_map.items():
+            for pos, item in enumerate(items):
+                id_to_pos[item["id"]] = (sid, pos)
+
+        expanded = []
+        for item in selected:
+            loc = id_to_pos.get(item.id)
+            if loc is None:
+                expanded.append(item)
+                continue
+            sid, pos = loc
+            items = session_map[sid]
+            start = max(0, pos - CONTEXT_RADIUS)
+            end = min(len(items), pos + CONTEXT_RADIUS + 1)
+            # 收集上下文内容
+            context_parts = []
+            seen_hashes = set()
+            char_budget = CONTEXT_MAX_CHARS
+            for p in range(start, end):
+                neighbor = items[p]
+                if neighbor["content_hash"] in seen_hashes:
+                    continue
+                seen_hashes.add(neighbor["content_hash"])
+                prefix = ">>> " if p == pos else "    "
+                content = neighbor["content"]
+                if len(content) > char_budget:
+                    content = content[:char_budget]
+                context_parts.append(f"{prefix}{content}")
+                char_budget -= len(content)
+                if char_budget <= 0:
+                    break
+            if len(context_parts) > 1:
+                expanded.append(
+                    SearchHit(
+                        id=item.id,
+                        content="\n".join(context_parts),
+                        score=item.score,
+                        created_at=item.created_at,
+                    )
+                )
+            else:
+                expanded.append(item)
+        return expanded
+
     def _embed_query(self, query: str) -> tuple[float, ...] | None:
         if self._embedder is None:
             return None
@@ -562,8 +763,9 @@ class MemoryStore:
         user_id: str,
         candidate_limit: int,
     ) -> list[sqlite3.Row]:
-        query_terms = _canonical_terms(query)
-        option_terms = _canonical_terms(" ".join(options))
+        # 扩展查询词：基础词形 + CJK n-gram + 概念同义词
+        query_terms = _canonical_terms(query) | set(_cjk_ngrams(query)) | _concept_expansion(query)
+        option_terms = _canonical_terms(" ".join(options)) | set(_cjk_ngrams(" ".join(options)))
         if not query_terms and not option_terms:
             return []
         rows = connection.execute(
@@ -577,7 +779,8 @@ class MemoryStore:
         ).fetchall()
         matching = []
         for row in rows:
-            content_terms = _canonical_terms(str(row["content"]))
+            content = str(row["content"])
+            content_terms = _canonical_terms(content) | set(_cjk_ngrams(content))
             if query_terms & content_terms or option_terms & content_terms:
                 matching.append(row)
         return matching[:candidate_limit]
@@ -591,22 +794,25 @@ class MemoryStore:
         candidate_limit: int,
     ) -> list[sqlite3.Row]:
         rows_by_id: dict[str, sqlite3.Row] = {}
+        # 从两个 FTS 表（原始 unicode61 + porter 词干）分别查询，合并结果
+        fts_tables = ("memories_fts", "memories_fts_porter")
         for expression in expressions:
             if not expression:
                 continue
-            rows = connection.execute(
-                """
-                SELECT memories.id, memories.content, memories.created_at, memories.content_hash,
-                       bm25(memories_fts) AS bm25_score
-                FROM memories_fts
-                JOIN memories ON memories.id = memories_fts.memory_id
-                WHERE memories_fts MATCH ? AND memories.user_id = ?
-                LIMIT ?
-                """,
-                (expression, user_id, candidate_limit),
-            ).fetchall()
-            for row in rows:
-                rows_by_id.setdefault(str(row["id"]), row)
+            for fts_table in fts_tables:
+                rows = connection.execute(
+                    f"""
+                    SELECT memories.id, memories.content, memories.created_at, memories.content_hash,
+                           bm25({fts_table}) AS bm25_score
+                    FROM {fts_table}
+                    JOIN memories ON memories.id = {fts_table}.memory_id
+                    WHERE {fts_table} MATCH ? AND memories.user_id = ?
+                    LIMIT ?
+                    """,
+                    (expression, user_id, candidate_limit),
+                ).fetchall()
+                for row in rows:
+                    rows_by_id.setdefault(str(row["id"]), row)
         return list(rows_by_id.values())
 
     def _vector_candidate_rows(
@@ -791,10 +997,11 @@ class MemoryStore:
                 ).fetchall()
                 memory_ids = [row["id"] for row in rows]
                 if memory_ids:
-                    connection.executemany(
-                        "DELETE FROM memories_fts WHERE memory_id = ?",
-                        ((memory_id,) for memory_id in memory_ids),
-                    )
+                    for table in ("memories_fts", "memories_fts_porter"):
+                        connection.executemany(
+                            f"DELETE FROM {table} WHERE memory_id = ?",
+                            ((memory_id,) for memory_id in memory_ids),
+                        )
                 deleted = connection.execute(
                     "DELETE FROM add_requests WHERE committed_at < ?",
                     (cutoff_text,),
@@ -834,6 +1041,59 @@ def _stable_id(prefix: str, request_id: str, sequence: str) -> str:
     return f"{prefix}_{digest}"
 
 
+def _format_date(dt: datetime) -> str:
+    """Format a datetime as 'Month Day, Year' (e.g. 'January 15, 2024')."""
+    return f"{dt:%B} {dt.day}, {dt.year}"
+
+
+def _format_evidence(role: str, content: str, created_at: str) -> str:
+    """Format evidence with temporal enrichment (InvMem-style).
+
+    With TEMPORAL_ENRICHMENT=True, produces:
+        [user | Message date: January 15, 2024 at 14:30 UTC] I live in Berlin.
+    Without enrichment, produces the original:
+        user: I live in Berlin.
+    """
+    if not TEMPORAL_ENRICHMENT:
+        return f"{role}: {content}"
+    message_time = _created_at_datetime(created_at)
+    if message_time is None:
+        return f"[{role}] {content}"
+    rendered = (
+        f"[{role} | Message date: {_format_date(message_time)} "
+        f"at {message_time:%H:%M} UTC] {content}"
+    )
+    # Resolve relative time references in the content
+    resolved = _resolve_relative_times(content, created_at)
+    if resolved != content and "[Resolved relative dates:" in resolved:
+        # Extract just the annotation part
+        ann_start = resolved.index("[Resolved relative dates:")
+        rendered += f" {resolved[ann_start:]}"
+    return rendered
+
+
+def _extract_role_from_evidence(evidence: str) -> tuple[str, str]:
+    """Split 'role: content' into (role, content)."""
+    colon = evidence.find(": ")
+    if colon == -1:
+        return ("user", evidence)
+    return (evidence[:colon], evidence[colon + 2:])
+
+
+def _min_max_normalize(values: list[float]) -> list[float]:
+    """Min-max normalize scores to [0, 1]. All equal → [0.0]*n."""
+    if not values:
+        return []
+    n = len(values)
+    if n == 1:
+        return [1.0]
+    mn = min(values)
+    mx = max(values)
+    if mx - mn < 1e-12:
+        return [0.0] * n
+    return [(v - mn) / (mx - mn) for v in values]
+
+
 def stable_memory_id(request_id: str, sequence: int) -> str:
     """Return the public deterministic memory ID for a source message."""
 
@@ -850,13 +1110,114 @@ def _timestamp_to_iso(timestamp: int | None) -> str | None:
     return datetime.fromtimestamp(timestamp / 1000, tz=UTC).isoformat()
 
 
-def _fts_expression(query: str) -> str:
+def _fts_expression(query: str, *, temporal_intent: str = "none") -> str:
     tokens = {
         variant
         for token in TOKEN_RE.findall(query)
         for variant in _term_variants(token)
     }
+    # 加入 CJK n-gram 和概念同义词扩展
+    tokens.update(_cjk_ngrams(query))
+    tokens.update(_concept_expansion(query))
+    if temporal_intent == "point":
+        # 时间点问题：加入日期相关词宽召回
+        tokens.update({"date", "time", "year", "month", "day", "日期", "时间", "时间点", "时间线"})
     return " OR ".join('"' + token.replace('"', '""') + '"' for token in sorted(tokens))
+
+
+def _cjk_ngrams(text: str) -> set[str]:
+    """Extract 2-gram and 3-gram CJK substrings for better Chinese matching."""
+    ngrams: set[str] = set()
+    for run in CJK_RE.findall(text):
+        if len(run) <= 1:
+            if run not in CJK_STOPWORDS:
+                ngrams.add(run)
+            continue
+        # 去重：只加 2-gram 和 3-gram
+        for size in (2, 3):
+            for i in range(len(run) - size + 1):
+                gram = run[i : i + size]
+                if gram not in CJK_STOPWORDS:
+                    ngrams.add(gram)
+    # 多个 CJK 段之间的边界 2-gram（"我爱北京" 拆成 "我爱" "北京"）
+    runs = CJK_RE.findall(text)
+    for i in range(len(runs) - 1):
+        boundary = runs[i][-1] + runs[i + 1][0]
+        if boundary not in CJK_STOPWORDS:
+            ngrams.add(boundary)
+    return ngrams
+
+
+def _concept_expansion(query: str) -> set[str]:
+    """Expand query terms with concept-group synonyms (semantic vocabulary)."""
+    terms = _canonical_terms(query)
+    if not terms:
+        return set()
+    expanded: set[str] = set()
+    for group in CONCEPT_GROUPS:
+        if terms & group:
+            expanded.update(group - terms)
+    return expanded
+
+
+def _detect_temporal_intent(query: str) -> TemporalIntent:
+    """Classify the query's temporal intent (latest/earliest/sequence/point/none)."""
+    normalized = query.casefold()
+    # 中文和英文标记
+    if any(m in normalized for m in LATEST_MARKERS):
+        return "latest"
+    if any(m in normalized for m in EARLIEST_MARKERS):
+        return "earliest"
+    if any(m in normalized for m in SEQUENCE_MARKERS):
+        return "sequence"
+    if any(m in normalized for m in POINT_MARKERS):
+        return "point"
+    return "none"
+
+
+def _compute_time_score(recency_score: float, temporal_intent: str) -> float:
+    """Apply temporal-intent-aware time scoring on top of recency."""
+    if temporal_intent == "latest":
+        return W_RECENCY_LATEST * recency_score
+    if temporal_intent == "earliest":
+        return W_RECENCY_EARLIEST * (1.0 - recency_score)
+    if temporal_intent in {"sequence", "point"}:
+        return W_TIMEPOINT_MILD
+    return 0.0
+
+
+def _resolve_relative_times(content: str, created_at: str) -> str:
+    """Resolve relative time expressions (yesterday, last week...) to absolute dates.
+
+    Mirrors InvMem's temporal enrichment: annotated evidence helps the downstream
+    answer model resolve time-relative facts without hallucinating.
+    """
+    message_time = _created_at_datetime(created_at)
+    if message_time is None:
+        return content
+    annotations: list[str] = []
+    seen: set[str] = set()
+    for pattern, resolver in RELATIVE_TIME_PATTERNS:
+        for match in re.finditer(pattern, content, flags=re.IGNORECASE):
+            phrase = match.group(0).casefold()
+            if phrase in seen:
+                continue
+            seen.add(phrase)
+            resolved = resolver(message_time)
+            annotations.append(f"{match.group(0)} = {resolved.strftime('%B %d, %Y')}")
+    if not annotations:
+        return content
+    return f"{content} [Resolved relative dates: {'; '.join(annotations)}]"
+
+
+def _created_at_datetime(value: str) -> datetime | None:
+    try:
+        moment = datetime.fromisoformat(value)
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=UTC)
+        return moment
+    except (ValueError, TypeError):
+        return None
 
 
 def _term_variants(token: str) -> set[str]:
@@ -919,6 +1280,7 @@ def _rank_memory(
     rrf_k: int,
     hybrid: bool,
     recency_score: float = 0.0,
+    temporal_intent: str = "none",
 ) -> RankedMemory:
     query_terms = _canonical_terms(query)
     option_terms = _canonical_terms(" ".join(options))
@@ -928,8 +1290,10 @@ def _rank_memory(
     bm25_score = float(row["bm25_score"])
     lexical_score = 1.0 / (1.0 + abs(bm25_score))
     if not hybrid:
-        exact_boost = 0.2 if query.casefold() in str(row["content"]).casefold() else 0.0
-        score = lexical_score + coverage_score + (0.2 * option_coverage) + exact_boost + recency_score
+        exact_boost = W_EXACT_FALLBACK if query.casefold() in str(row["content"]).casefold() else 0.0
+        # 时间意图感知
+        time_score = _compute_time_score(recency_score, temporal_intent)
+        score = lexical_score + coverage_score + (W_OPTION_FALLBACK * option_coverage) + exact_boost + time_score
         return RankedMemory(
             id=str(row["id"]),
             content=str(row["content"]),
@@ -937,20 +1301,21 @@ def _rank_memory(
             created_at=str(row["created_at"]),
             content_hash=str(row["content_hash"]),
         )
-    lexical_rrf = 0.6 / (rrf_k + lexical_rank) if lexical_rank is not None else 0.0
-    vector_rrf = 0.4 / (rrf_k + vector_rank) if vector_rank is not None else 0.0
-    exact_boost = 0.04 if query.casefold() in str(row["content"]).casefold() else 0.0
+    lexical_rrf = W_RRF_LEXICAL / (rrf_k + lexical_rank) if lexical_rank is not None else 0.0
+    vector_rrf = W_RRF_VECTOR / (rrf_k + vector_rank) if vector_rank is not None else 0.0
+    exact_boost = W_EXACT_BOOST if query.casefold() in str(row["content"]).casefold() else 0.0
+    time_score = _compute_time_score(recency_score, temporal_intent)
     return RankedMemory(
         id=str(row["id"]),
         content=str(row["content"]),
         score=(
             lexical_rrf
             + vector_rrf
-            + (0.35 * vector_similarity)
-            + (0.1 * coverage_score)
-            + (0.02 * option_coverage)
+            + (W_VECTOR_SIM * vector_similarity)
+            + (W_COVERAGE * coverage_score)
+            + (W_OPTION_COVERAGE * option_coverage)
             + exact_boost
-            + recency_score
+            + time_score
         ),
         created_at=str(row["created_at"]),
         content_hash=str(row["content_hash"]),
@@ -1012,6 +1377,8 @@ def _recency_scores(rows: list[sqlite3.Row]) -> dict[str, float]:
         return {memory_id: 0.0 for memory_id in timestamps}
     oldest = min(valid)
     span = max(valid) - oldest
+    if span == 0.0:
+        return {memory_id: 0.0 for memory_id in timestamps}
     return {
         memory_id: 0.15 * ((timestamp - oldest) / span) if timestamp is not None else 0.0
         for memory_id, timestamp in timestamps.items()

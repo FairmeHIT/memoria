@@ -6,6 +6,7 @@ import math
 import re
 import struct
 from collections.abc import Sequence
+from pathlib import Path
 from typing import Protocol
 
 from memoria.model_audit import ModelCallAudit
@@ -65,6 +66,137 @@ class HashingEmbedder:
         return tuple(value / magnitude for value in values)
 
 
+_BGE_MODEL_URLS = (
+    "https://hf-mirror.com/{repo_id}/resolve/main/{filename}",
+    "https://huggingface.co/{repo_id}/resolve/main/{filename}",
+)
+
+
+def _auto_download_model(target_dir: str | Path) -> Path:
+    """Download the BGE model weights to *target_dir* if it is empty.
+
+    Tries the Hugging Face mirror (hf-mirror.com) first, then the official
+    endpoint.  Raises ``RuntimeError`` if neither is reachable.
+    """
+    dest = Path(target_dir)
+    if dest.exists() and any(dest.iterdir()):
+        return dest  # already populated
+
+    dest.mkdir(parents=True, exist_ok=True)
+    repo_id = "BAAI/bge-small-en-v1.5"
+    # The minimal set of files SentenceTransformer needs to run.
+    required = (
+        "config.json",
+        "config_sentence_transformers.json",
+        "modules.json",
+        "sentence_bert_config.json",
+        "special_tokens_map.json",
+        "tokenizer_config.json",
+        "tokenizer.json",
+        "vocab.txt",
+        "model.safetensors",
+    )
+
+    import urllib.request as _request
+
+    for url_template in _BGE_MODEL_URLS:
+        ok = 0
+        for name in required:
+            url = url_template.format(repo_id=repo_id, filename=name)
+            out = dest / name
+            try:
+                _request.urlretrieve(url, out, timeout=120)
+                ok += 1
+            except Exception:
+                break
+        if ok == len(required):
+            return dest
+    raise RuntimeError(
+        f"Could not download model {repo_id} from any mirror. "
+        "Please check your internet connection, or install the model manually: "
+        "https://hf-mirror.com/{repo_id}"
+    )
+
+
+class LocalBgeEmbedder:
+    """Local sentence-transformers BGE embedding (CPU, no external service.
+
+    Mirrors InvMem's approach: bge-small-en-v1.5 loaded locally via
+    sentence-transformers, with BGE query prefix. Runs on CPU by default,
+    requires ~130 MB memory and ~5-10 ms per message.
+
+    model_name can be a HuggingFace repo ID (e.g. "BAAI/bge-small-en-v1.5")
+    or a local path (e.g. "models/bge-small-en-v1.5"). When the path does not
+    exist yet, the model is downloaded automatically — first from the Hugging
+    Face mirror (hf-mirror.com, fast in CN) and then from huggingface.co.
+    """
+
+    def __init__(
+        self,
+        *,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        dimensions: int = 384,
+    ) -> None:
+        from sentence_transformers import SentenceTransformer
+
+        # Normalize the model reference: if it has a "/" it is a repo ID
+        # (or an explicit path); otherwise treat bare names as repo IDs.
+        repo_id = model_name
+        local_dir: Path | None = None
+        candidate = Path(model_name)
+        if not model_name.startswith(("./", "../", "/")) and candidate.exists():
+            # A concrete existing path: keep it, and base the fingerprint on
+            # the basename so a moved checkout still reuses cached vectors.
+            local_dir = candidate
+            repo_id = candidate.name
+        elif "/" in model_name and candidate.exists():
+            local_dir = candidate
+            repo_id = candidate.name
+        # If a local path was requested but is missing, download it first.
+        if local_dir is None and model_name.startswith(("./", "../", "/")):
+            local_dir = _auto_download_model(model_name)
+            repo_id = Path(model_name).name
+        if local_dir is not None:
+            model_path = str(local_dir.resolve())
+        else:
+            # Repo ID: check conventional checkout dirs before falling
+            # through to sentence-transformers (which downloads from HF).
+            for candidate_dir in (
+                Path("models") / repo_id,                     # models/BAAI/bge-small-en-v1.5
+                Path("models") / repo_id.rsplit("/", 1)[-1],  # models/bge-small-en-v1.5
+                Path("models") / repo_id.replace("/", "--"),  # models/BAAI--bge-small-en-v1.5
+            ):
+                if candidate_dir.exists():
+                    model_path = str(candidate_dir.resolve())
+                    break
+            else:
+                model_path = repo_id  # download via sentence-transformers
+
+        self.model_name = repo_id
+        self.dimensions = dimensions
+        # Fingerprint on the bare model name so the default repo ID
+        # (BAAI/bge-small-en-v1.5) and a local checkout (models/bge-small-en-v1.5)
+        # share the same vector cache fingerprint.
+        self.fingerprint = f"local-bge:{Path(repo_id).name}:{dimensions}"
+        # BGE query prefix: marks the query side for asymmetric retrieval.
+        # InvMem applies this automatically when model name contains "bge" and "-en-".
+        self._query_prefix = "Represent this sentence for searching relevant passages: "
+        self._model = SentenceTransformer(model_path)
+
+    def embed(self, texts: Sequence[str]) -> tuple[tuple[float, ...], ...]:
+        return tuple(self._encode_one(text) for text in texts)
+
+    def _encode_one(self, text: str) -> tuple[float, ...]:
+        vectors = self._model.encode(
+            [self._query_prefix + text],
+            batch_size=1,
+            normalize_embeddings=True,
+            convert_to_numpy=True,
+            show_progress_bar=False,
+        )
+        return tuple(float(v) for v in vectors[0])
+
+
 def create_embedder(
     *,
     backend: str,
@@ -112,7 +244,9 @@ def create_embedder(
             auth_scheme=auth_scheme,
             recorder=recorder,
         )
-    raise ValueError("MEMORIA_EMBEDDING_BACKEND must be none, hashing, qwen, or bge")
+    if backend == "local":
+        return LocalBgeEmbedder(model_name=model, dimensions=dimensions)
+    raise ValueError("MEMORIA_EMBEDDING_BACKEND must be none, hashing, qwen, bge, or local")
 
 
 def serialize_vector(vector: Sequence[float]) -> bytes:

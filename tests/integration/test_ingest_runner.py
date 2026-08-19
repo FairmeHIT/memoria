@@ -30,4 +30,4 @@ def test_ingest_file_makes_imported_add_cases_searchable(client, tmp_path) -> No
         user_id="import-user",
         top_k=10,
     )
-    assert hits[0].content == "user: I collect blue notebooks."
+    assert "I collect blue notebooks." in hits[0].content

@@ -25,6 +25,4 @@ def test_search_matches_common_inflection_variants_without_external_models(clien
     )
 
     assert response.status_code == 200
-    assert response.json()["data"][0]["content"] == (
-        "user: Researchers analyze datasets for science."
-    )
+    assert "Researchers analyze datasets for science." in response.json()["data"][0]["content"]

@@ -10,9 +10,9 @@ from dotenv import load_dotenv
 
 AuthScheme = Literal["none", "token", "bearer", "x_api_key"]
 VALID_AUTH_SCHEMES: frozenset[str] = frozenset({"none", "token", "bearer", "x_api_key"})
-EmbeddingBackend = Literal["none", "hashing", "qwen", "bge"]
+EmbeddingBackend = Literal["none", "hashing", "qwen", "bge", "local"]
 RerankerBackend = Literal["none", "qwen", "bge", "gpt4o"]
-VALID_EMBEDDING_BACKENDS: frozenset[str] = frozenset({"none", "hashing", "qwen", "bge"})
+VALID_EMBEDDING_BACKENDS: frozenset[str] = frozenset({"none", "hashing", "qwen", "bge", "local"})
 VALID_RERANKER_BACKENDS: frozenset[str] = frozenset({"none", "qwen", "bge", "gpt4o"})
 
 
@@ -118,8 +118,8 @@ class Settings:
             vector_candidate_limit=int(os.environ.get("MEMORIA_VECTOR_CANDIDATE_LIMIT", "500")),
             rrf_k=int(os.environ.get("MEMORIA_RRF_K", "60")),
             embedding_model=os.environ.get(
-                "MEMORIA_BGE_EMBEDDING_MODEL" if embedding_backend == "bge" else "MEMORIA_EMBEDDING_MODEL",
-                "BAAI/bge-m3" if embedding_backend == "bge" else "text-embedding-v4",
+                "MEMORIA_BGE_EMBEDDING_MODEL" if embedding_backend in ("bge", "local") else "MEMORIA_EMBEDDING_MODEL",
+                "BAAI/bge-small-en-v1.5" if embedding_backend == "local" else ("BAAI/bge-m3" if embedding_backend == "bge" else "text-embedding-v4"),
             ),
             embedding_base_url=(
                 bge_base_url if embedding_backend == "bge" else os.environ.get("MEMORIA_EMBEDDING_BASE_URL", "")
