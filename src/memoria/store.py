@@ -628,11 +628,12 @@ class MemoryStore:
                 {str(row["id"]): row for row in vector_rows if str(row["id"]) not in rows_by_id}
             )
             rows = list(rows_by_id.values())
-            # 历史/最早意图 → 不过滤覆写（保留旧记录）
+            # 历史/最早意图或组合推理 → 不过滤覆写（保留旧记录）
             historical = temporal_intent in ("earliest", "historical") or _is_historical_query(query)
+            compositional = _is_compositional_query(query)
             superseded_ids = (
                 set()
-                if historical
+                if (historical or compositional)
                 else self._superseded_memory_ids(connection, [str(row["id"]) for row in rows])
             )
             # 程序性记忆 boosting：查询涉及偏好/习惯/流程时拉取匹配项
@@ -681,11 +682,7 @@ class MemoryStore:
             ]
             ranked.sort(key=lambda item: (-item.score, item.created_at, item.id))
         selected: list[SearchHit] = []
-        seen_content_hashes: set[str] = set()
         for item in ranked:
-            if item.content_hash in seen_content_hashes:
-                continue
-            seen_content_hashes.add(item.content_hash)
             # 时间富化证据格式（InvMem 风格）：[role | Message date: ...] content
             role, raw_content = _extract_role_from_evidence(item.content)
             content = _format_evidence(role, raw_content, item.created_at)
@@ -716,6 +713,9 @@ class MemoryStore:
         # CrossEncoder (ms-marco) 是纯英文模型，中文查询跳过 CE 以免疫乱
         # 多语言模型（bge-reranker-v2-m3）或路由模型不受此限制
         if CJK_RE.search(query) and not getattr(self._reranker, "supports_cjk", True):
+            return ranked
+        # 组合推理查询跳过 CE（CE 不理解多跳组合，保留词法 + 概念加分排序）
+        if _is_compositional_query(query):
             return ranked
         temporal_intent = _detect_temporal_intent(query)
         candidates = ranked[: self._settings.reranker_candidate_limit]
@@ -1524,11 +1524,15 @@ def _rank_memory(
         option_coverage = len(option_terms & content_terms) / len(option_terms) if option_terms else 0.0
     bm25_score = float(row["bm25_score"])
     lexical_score = 1.0 / (1.0 + abs(bm25_score))
+    # 组合推理加分：内容命中查询概念扩展词（如 "capital" <-> "country"）
+    concept_boost = 0.0
+    if _is_compositional_query(query):
+        concept_boost = 0.25 * len(_concept_expansion(query) & content_terms)
     if not hybrid:
         exact_boost = W_EXACT_FALLBACK if query.casefold() in str(row["content"]).casefold() else 0.0
         # 时间意图感知
         time_score = _compute_time_score(recency_score, temporal_intent)
-        score = lexical_score + coverage_score + (W_OPTION_FALLBACK * option_coverage) + exact_boost + time_score
+        score = lexical_score + coverage_score + (W_OPTION_FALLBACK * option_coverage) + exact_boost + time_score + concept_boost
         return RankedMemory(
             id=str(row["id"]),
             content=str(row["content"]),
@@ -1551,6 +1555,7 @@ def _rank_memory(
             + (W_OPTION_COVERAGE * option_coverage)
             + exact_boost
             + time_score
+            + concept_boost
         ),
         created_at=str(row["created_at"]),
         content_hash=str(row["content_hash"]),
@@ -1565,6 +1570,8 @@ def _candidate_ranks(
     query_terms = _canonical_terms(query) | _concept_expansion(query)
     # 过滤单字符选项 token（如 "A. Peanuts" 中的 "a"/"b"），避免污染排名
     option_terms = {t for t in _canonical_terms(" ".join(options)) if len(t) > 1}
+    expansion_terms = _concept_expansion(query)
+    compositional = _is_compositional_query(query)
 
     def score(row: sqlite3.Row) -> tuple[float, str, str]:
         content = str(row["content"])
@@ -1574,8 +1581,12 @@ def _candidate_ranks(
         bm25_score = float(row["bm25_score"])
         lexical_score = 1.0 / (1.0 + abs(bm25_score))
         exact_boost = 0.2 if query.casefold() in content.casefold() else 0.0
+        # 组合推理加分：内容命中查询概念扩展词（如 "capital" <-> "country"）
+        concept_hits = 0
+        if compositional:
+            concept_hits = len(expansion_terms & content_terms)
         return (
-            -(lexical_score + coverage + (0.2 * option_coverage) + exact_boost),
+            -(lexical_score + coverage + (0.2 * option_coverage) + exact_boost + (0.25 * concept_hits)),
             str(row["created_at"]),
             str(row["id"]),
         )
@@ -1604,6 +1615,30 @@ def _is_current_query(query: str) -> bool:
         "最新",
     )
     return any(marker in normalized for marker in markers)
+
+
+def _is_compositional_query(query: str) -> bool:
+    """检测组合推理查询：需要跨事实组合才能回答。
+
+    例如 "Which country do I live in?" 需要 "I live in Berlin." +
+    "Berlin is the capital of Germany." 两个事实才能推理出答案国家。
+    这类查询不应受 supersession 过滤（旧事实可能包含组合所需信息）。
+    """
+    q = query.casefold()
+    # 模式：which country/city/company + live/work/study
+    if re.search(r"which\s+(country|city|company|school|hospital|university|team)", q) and re.search(
+        r"\b(live|work|study|stay|play|belong)\b", q
+    ):
+        return True
+    # 模式：who is + at/for（"Who is my manager at Google?"）
+    if re.search(r"who\s+is\s+", q) and re.search(r"\b(at|for|from)\s+\w+", q):
+        return True
+    # 模式：what is the + based on / derived from
+    if re.search(r"what\s+(is|was)\s+(the|my|your)", q) and re.search(
+        r"\b(based on|derived from|result of)\b", q
+    ):
+        return True
+    return False
 
 
 def _recency_scores(rows: list[sqlite3.Row]) -> dict[str, float]:
