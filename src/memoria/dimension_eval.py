@@ -66,7 +66,7 @@ def _eval(query: str, *rid_seq_pairs: tuple[str, int], **kw: Any) -> dict[str, A
     relevant_ids = {stable_memory_id(rid, seq) for rid, seq in rid_seq_pairs}
     case: dict[str, Any] = {
         "query": query,
-        "user_id": "dim-user",
+        "user_id": kw.pop("user_id", "dim-user"),
         "relevant_ids": list(relevant_ids),
         "top_k": kw.pop("top_k", 100),
     }
@@ -347,17 +347,24 @@ def run_dimension_eval(
     if scenarios is None:
         scenarios = _build_scenarios()
 
-    # Add all scenario memories (each scenario uses the same user_id for simplicity)
+    # Add all scenario memories (each scenario uses a distinct user_id so
+    # supersession/recency signals do not leak across dimensions)
     for scenario in scenarios:
+        scenario_user = f"dim-user-{scenario.dimension.lower()}"
         for add_dict in scenario.adds:
-            _add_to_store(store, add_dict)
+            # 确保该维度内所有 adds 使用独立 user_id
+            _add_to_store(store, {**add_dict, "user_id": scenario_user})
 
     # Evaluate per dimension
     per_dimension: dict[str, dict[str, float | int]] = {}
     all_cases: list[EvaluationCase] = []
 
     for scenario in scenarios:
-        cases = [EvaluationCase(**c) for c in scenario.cases]
+        scenario_user = f"dim-user-{scenario.dimension.lower()}"
+        cases = [
+            EvaluationCase(**{**c, "user_id": scenario_user})
+            for c in scenario.cases
+        ]
         all_cases.extend(cases)
         metrics = evaluate_cases(store, cases, workers=1)
         per_dimension[scenario.dimension] = metrics

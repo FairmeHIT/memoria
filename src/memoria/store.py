@@ -876,6 +876,20 @@ class MemoryStore:
             """,
             (user_id, max(candidate_limit, 5_000)),
         ).fetchall()
+        # CJK 查询：词法 n-gram 与英文记忆几乎无交集，直接放行全部候选，
+        # 交由多语言 CE 重排（bge-reranker-v2-m3 支持中文查询）。
+        # 若配置了英文 CE（不支持 CJK），search() 会跳过重排，此时
+        # 保留英文词干交集匹配，避免纯噪音。
+        if CJK_RE.search(query) or any(CJK_RE.search(opt) for opt in options):
+            narrowed = []
+            if getattr(self._reranker, "supports_cjk", False):
+                return rows[:candidate_limit]
+            for row in rows:
+                content = str(row["content"])
+                content_terms = _canonical_terms(content) | set(_cjk_ngrams(content))
+                if query_terms & content_terms or option_terms & content_terms:
+                    narrowed.append(row)
+            return narrowed[:candidate_limit]
         matching = []
         for row in rows:
             content = str(row["content"])
@@ -1026,20 +1040,24 @@ class MemoryStore:
             if claim.exclusive:
                 prior_rows = connection.execute(
                     """
-                    SELECT memory_id
-                    FROM memory_claims
-                    WHERE user_id = ? AND predicate = ? AND polarity = ?
+                    SELECT mc.memory_id
+                    FROM memory_claims mc
+                    JOIN memories m ON m.id = mc.memory_id
+                    WHERE mc.user_id = ? AND mc.predicate = ? AND mc.polarity = ?
+                      AND m.created_at <= ?
                     """,
-                    (user_id, claim.predicate, claim.polarity),
+                    (user_id, claim.predicate, claim.polarity, created_at),
                 ).fetchall()
             else:
                 prior_rows = connection.execute(
                     """
-                    SELECT memory_id
-                    FROM memory_claims
-                    WHERE user_id = ? AND predicate = ? AND value_key = ? AND polarity != ?
+                    SELECT mc.memory_id
+                    FROM memory_claims mc
+                    JOIN memories m ON m.id = mc.memory_id
+                    WHERE mc.user_id = ? AND mc.predicate = ? AND mc.value_key = ? AND mc.polarity != ?
+                      AND m.created_at <= ?
                     """,
-                    (user_id, claim.predicate, claim.value_key, claim.polarity),
+                    (user_id, claim.predicate, claim.value_key, claim.polarity, created_at),
                 ).fetchall()
             connection.execute(
                 """
