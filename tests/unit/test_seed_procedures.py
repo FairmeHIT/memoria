@@ -21,7 +21,7 @@ from memoria.seed_procedures import (
 @pytest.fixture
 def short_circuit_reranker():
     """Override the reranker to avoid loading the real model."""
-    with patch("memoria.qwen.create_reranker") as mock:
+    with patch("memoria.runtime.create_reranker") as mock:
         mock.return_value = None
         yield mock
 

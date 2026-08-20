@@ -1,0 +1,10 @@
+serverAddr = "47.112.174.22"
+serverPort = 7000
+auth.token = "frp-secure-token-2024"
+
+[[proxies]]
+name = "memoria-8000"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8081
+remotePort = 8000
