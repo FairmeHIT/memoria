@@ -167,3 +167,66 @@ pytest tests/ -k dimension -v
 The pytest tests assert each dimension's Recall@100 stays above a baseline
 threshold (defined in `tests/integration/test_dimension_eval.py`), acting as
 a regression guard.
+
+## Public deployment via frp
+
+This deployment is publicly accessible through an frp tunnel on Alibaba Cloud.
+
+| Endpoint | URL |
+|----------|-----|
+| Server | `http://47.112.174.22:8000` |
+| Health | `GET http://47.112.174.22:8000/health` |
+| Add    | `POST http://47.112.174.22:8000/v1/add` |
+| Search | `POST http://47.112.174.22:8000/v1/search` |
+
+### frp client config
+
+```bash
+# Start the tunnel (frpc installed via brew)
+frpc -c ./frpc.toml
+```
+
+The config (`frpc.toml`) forwards local port 8081 to the public server port 8000:
+
+```toml
+serverAddr = "47.112.174.22"
+serverPort = 7000
+auth.token = "frp-secure-token-2024"
+
+[[proxies]]
+name = "memoria-8000"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 8081
+remotePort = 8000
+```
+
+### Quick test
+
+```bash
+API_KEY=$(grep MEMORIA_API_KEY .env | cut -d= -f2)
+BASE=http://47.112.174.22:8000
+
+# Health
+curl -s $BASE/health
+
+# Add a memory
+curl -s -X POST $BASE/v1/add \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{
+    "request_id": "test-001",
+    "user_id": "my_user",
+    "session_id": "session-abc",
+    "messages": [
+      {"role": "user", "content": "I like playing basketball."},
+      {"role": "assistant", "content": "Got it!"}
+    ]
+  }'
+
+# Search
+curl -s -X POST $BASE/v1/search \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $API_KEY" \
+  -d '{"user_id": "my_user", "query": "basketball", "top_k": 5}'
+```
