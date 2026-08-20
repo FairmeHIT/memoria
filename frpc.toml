@@ -6,5 +6,5 @@ auth.token = "frp-secure-token-2024"
 name = "memoria-8000"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 8081
+localPort = 8443
 remotePort = 8000

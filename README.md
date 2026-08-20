@@ -168,25 +168,48 @@ The pytest tests assert each dimension's Recall@100 stays above a baseline
 threshold (defined in `tests/integration/test_dimension_eval.py`), acting as
 a regression guard.
 
-## Public deployment via frp
+## Public deployment via frp (HTTPS)
 
 This deployment is publicly accessible through an frp tunnel on Alibaba Cloud.
+Traffic is TLS-encrypted end-to-end via a local HTTPS proxy with a self-signed
+certificate (no domain name required yet).
 
 | Endpoint | URL |
 |----------|-----|
-| Server | `http://47.112.174.22:8000` |
-| Health | `GET http://47.112.174.22:8000/health` |
-| Add    | `POST http://47.112.174.22:8000/v1/add` |
-| Search | `POST http://47.112.174.22:8000/v1/search` |
+| Server | `https://47.112.174.22:8000` |
+| Health | `GET https://47.112.174.22:8000/health` |
+| Add    | `POST https://47.112.174.22:8000/v1/add` |
+| Search | `POST https://47.112.174.22:8000/v1/search` |
 
-### frp client config
+> **Note:** The certificate is self-signed, so all clients must use `curl -k`
+> (or trust `server.crt`). If a domain name is added later, replace the
+> self-signed cert with a Let's Encrypt certificate from Caddy/nginx.
+
+### Components
+
+| Component | Port | Role |
+|-----------|------|------|
+| `memoria` (uvicorn) | `127.0.0.1:8081` | FastAPI HTTP service |
+| `https_proxy.py` | `127.0.0.1:8443` | Terminates TLS, proxies to :8081 |
+| `frpc` | — | TCP tunnel to Alibaba Cloud frps |
+
+### Start the stack
 
 ```bash
-# Start the tunnel (frpc installed via brew)
+# 1. Generate self-signed certificate (once)
+openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt \
+  -days 365 -nodes -subj "/CN=47.112.174.22" \
+  -addext "subjectAltName=IP:47.112.174.22"
+
+# 2. Start the local HTTPS proxy
+python https_proxy.py
+
+# 3. Start the tunnel (frpc installed via brew)
 frpc -c ./frpc.toml
 ```
 
-The config (`frpc.toml`) forwards local port 8081 to the public server port 8000:
+The config (`frpc.toml`) forwards local port 8443 (HTTPS proxy) to the public
+server port 8000:
 
 ```toml
 serverAddr = "47.112.174.22"
@@ -197,21 +220,21 @@ auth.token = "frp-secure-token-2024"
 name = "memoria-8000"
 type = "tcp"
 localIP = "127.0.0.1"
-localPort = 8081
+localPort = 8443
 remotePort = 8000
 ```
 
-### Quick test
+### Public smoke test
 
 ```bash
 API_KEY=$(grep MEMORIA_API_KEY .env | cut -d= -f2)
-BASE=http://47.112.174.22:8000
+BASE=https://47.112.174.22:8000
 
 # Health
-curl -s $BASE/health
+curl -sk $BASE/health
 
 # Add a memory
-curl -s -X POST $BASE/v1/add \
+curl -sk -X POST $BASE/v1/add \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
   -d '{
@@ -225,7 +248,7 @@ curl -s -X POST $BASE/v1/add \
   }'
 
 # Search
-curl -s -X POST $BASE/v1/search \
+curl -sk -X POST $BASE/v1/search \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer $API_KEY" \
   -d '{"user_id": "my_user", "query": "basketball", "top_k": 5}'
